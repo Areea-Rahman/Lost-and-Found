@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from PIL import Image
 import pandas as pd
 from google import genai
+from google.genai import types
+
 
 # =======================
 # GEMINI CLIENT
@@ -197,11 +199,13 @@ def standardize_description(text: str, tags: dict) -> dict:
     full_prompt = f"{STANDARDIZER_PROMPT}\n\nHere is the structured input to standardize:\n{text}\n{tags_summary}"
 
     try:
-        model = gemini_client.models.get("gemini-1.5-flash")
-        response = model.generate_content(full_prompt)
-    except Exception as e:
-        st.error(f"Error calling Gemini for standardization: {e}")
-        return {}
+    response = gemini_client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=full_prompt,
+    )
+except Exception as e:
+    st.error(f"Error calling Gemini for standardization: {e}")
+    return {}
 
     try:
         cleaned = response.text.strip()
@@ -337,10 +341,13 @@ if page == "Upload Found Item (Operator)":
         st.stop()
 
     if "operator_chat" not in st.session_state:
-        st.session_state.operator_chat = gemini_client.models.start_chat(
-            system_instruction=GENERATOR_SYSTEM_PROMPT
-        )
-        st.session_state.operator_msgs = []
+    st.session_state.operator_chat = gemini_client.chats.create(
+        model="gemini-1.5-flash",
+        config=types.GenerateContentConfig(
+            system_instruction=GENERATOR_SYSTEM_PROMPT,
+        ),
+    )
+    st.session_state.operator_msgs = []
 
     # Show running conversation
     for msg in st.session_state.operator_msgs:
@@ -483,10 +490,14 @@ if page == "Report Lost Item (User)":
         )
 
     if "user_chat" not in st.session_state:
-        st.session_state.user_chat = gemini_client.models.start_chat(
-            system_instruction=USER_SIDE_GENERATOR_PROMPT
-        )
-        st.session_state.user_msgs = []
+    st.session_state.user_chat = gemini_client.chats.create(
+        model="gemini-1.5-flash",
+        config=types.GenerateContentConfig(
+            system_instruction=USER_SIDE_GENERATOR_PROMPT,
+        ),
+    )
+    st.session_state.user_msgs = []
+
 
     # Show chat history
     for msg in st.session_state.user_msgs:
@@ -569,3 +580,4 @@ Description: {extract_field(structured_text, 'Description')}
                         json.dumps(final_json),
                     )
                     st.success("Lost item report submitted.")
+
