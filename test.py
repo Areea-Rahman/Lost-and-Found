@@ -1,7 +1,7 @@
 # =======================
 # LOST & FOUND INTAKE SYSTEM
 # =======================
-from google import genai
+pip install google-genai
 import streamlit as st
 import sqlite3, json, re
 from datetime import datetime, timezone
@@ -401,4 +401,5 @@ if page == "Report Lost Item (User)":
             else:
                 add_lost_item(final_json["description"], contact, email, json.dumps(final_json))
                 st.success("Lost item report submitted successfully!")
+
 
