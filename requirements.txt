@@ -1,9 +1,9 @@
 streamlit
 google-genai
-langchain
+pandas
+Pillow
+sqlalchemy
+psycopg2-binary
 langchain-community
 langchain-openai
 pgvector
-psycopg2-binary
-pandas
-pillow
