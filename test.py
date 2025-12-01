@@ -20,6 +20,8 @@ from google.genai import errors as genai_errors
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document 
+# --- NEW REQUIRED IMPORT ---
+from langchain_community.vectorstores.utils import filter_complex_metadata 
 
 
 # -----------------------
@@ -354,7 +356,7 @@ def standardize_description(text_block: str, tags: Dict) -> Dict:
         "\n--- TAGS REFERENCE ---\n"
         f"Subway Location tags: {', '.join(tags['locations'][:50])}\n"
         f"Color tags: {', '.join(tags['colors'][:50])}\n"
-        f"Item Category tags: {', '.join(tags['categories'][:50])}\n"
+        f"Item Category tags: {', '. join(tags['categories'][:50])}\n"
         f"Item Type tags: {', '.join(tags['item_types'][:50])}\n"
     )
 
@@ -495,7 +497,7 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
         "found_id": str(found_id),
         "image_path": MOCK_IMAGE_URL, 
         "contact": contact,
-        "time": json_data.get("time"),
+        "time": json.dumps(json_data.get("time")), # Ensure time is a string/json string
     }
     
     # 2. Add all fields from final_json, aggressively converting lists to strings
@@ -509,6 +511,7 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
             metadata[key] = value
         else:
             # Fallback for unexpected types (like dicts) to JSON string
+            # This ensures keys like 'subway_location' don't accidentally contain lists
             metadata[key] = json.dumps(value) 
 
     # 3. Merge raw essential metadata (contact, ID) back in
@@ -527,6 +530,7 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
     except Exception as e:
         # Catch and log the error specifically related to vector storage
         st.error(f"Error saving found item to vector store: {e}")
+        st.error(f"Failed metadata dump: {metadata}")
         st.error("Please check your LLM's raw JSON output for complex types being created.")
         return -1
 
