@@ -1,87 +1,115 @@
 # =======================
-# LOST & FOUND INTAKE SYSTEM
+# LOST & FOUND INTAKE SYSTEM (Chroma Vector DB)
 # =======================
 
-import streamlit as st
-import sqlite3
 import json
 import re
 from datetime import datetime, timezone
-from PIL import Image
+from typing import Dict, Any, List, Tuple
+
 import pandas as pd
-import os 
-from typing import List, Dict, Any 
+import streamlit as st
+from PIL import Image
 
 from google import genai
 from google.genai import types
-from google.genai import errors as genai_errors  # for catching ClientError
+from google.genai import errors as genai_errors
 
-# Use a single constant for the model name
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+
+
+# -----------------------
+# BASIC CONFIG / THEME
+# -----------------------
+
 MODEL_NAME = "gemini-2.0-flash"
 
-# --- Hybrid Search Constants ---
-# We will use this to connect the SQLite metadata to the PGVector document
-COLLECTION_NAME = "lostandfound_items"
-PG_METADATA_FIELDS = ["subway_location", "color", "item_category", "item_type"]
+st.set_page_config(
+    page_title="Lost & Found Intake",
+    page_icon="🧳",
+    layout="wide",
+)
 
-# Mock Image Placeholder URL for Streamlit
-MOCK_IMAGE_URL = "https://placehold.co/100x100/A8A8A8/000000?text=IMG" 
+# Simple custom CSS for nicer cards / headers
+st.markdown(
+    """
+    <style>
+    .main-title {
+        font-size: 2rem;
+        font-weight: 700;
+        margin-bottom: 0.5rem;
+    }
+    .subtitle {
+        font-size: 0.95rem;
+        color: #555555;
+        margin-bottom: 0.8rem;
+    }
+    .card {
+        border-radius: 12px;
+        padding: 1rem 1.2rem;
+        border: 1px solid #E3E3E3;
+        background-color: #FAFAFA;
+        margin-bottom: 0.8rem;
+    }
+    .metric-card {
+        border-radius: 12px;
+        padding: 0.8rem 1rem;
+        border: 1px solid #E3E3E3;
+        background-color: #FFFFFF;
+        text-align: center;
+    }
+    .metric-card h3 {
+        margin: 0;
+        font-size: 0.9rem;
+        color: #777777;
+    }
+    .metric-card p {
+        margin: 0;
+        font-size: 1.4rem;
+        font-weight: 700;
+    }
+    .section-title {
+        font-size: 1.2rem;
+        font-weight: 600;
+        margin-top: 1.2rem;
+        margin-bottom: 0.4rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-# Optional vector-search imports (wrapped in try so app still runs if missing)
-try:
-    from langchain_community.vectorstores import PGVector
-    from langchain_openai import OpenAIEmbeddings
-    from langchain_core.documents import Document 
-
-    HAS_VECTOR_LIBS = True
-except Exception:
-    HAS_VECTOR_LIBS = False
-
-
-# =======================
-# SECRETS / CONFIG HELPERS
-# =======================
+# -----------------------
+# SECRETS / CLIENTS / VECTOR STORE
+# -----------------------
 
 @st.cache_resource
-def get_secrets():
-    """Read secrets and expose simple flags."""
+def get_secrets() -> Dict[str, Any]:
+    """Load API keys and config from Streamlit secrets."""
     try:
-        secrets_dict = st.secrets.to_dict()
+        s = st.secrets.to_dict()
     except Exception:
-        secrets_dict = {}
-
-    # NOTE: Assuming secrets are set up for OpenAI and PGVector in Streamlit secrets
-    gemini_key = secrets_dict.get("GEMINI_API_KEY")
-    # For PGVector, LangChain PGVector typically uses OpenAI for embeddings
-    openai_key = secrets_dict.get("OPENAI_API_KEY") 
-    pg_conn_string = secrets_dict.get("PG_CONNECTION_STRING")
-
+        s = {}
     return {
-        "raw": secrets_dict,
-        "openai_key": openai_key,
-        "pg_conn_string": pg_conn_string,
-        "has_gemini": gemini_key is not None,
-        "has_openai": openai_key is not None,
-        "has_pg": pg_conn_string is not None and HAS_VECTOR_LIBS,
+        "raw": s,
+        "gemini_key": s.get("GEMINI_API_KEY"),
+        "openai_key": s.get("OPENAI_API_KEY"),
     }
 
 
 secrets = get_secrets()
 
 
-# =======================
-# GEMINI CLIENT
-# =======================
-
 @st.cache_resource
 def get_gemini_client():
-    if not secrets["has_gemini"]:
+    """Initialize Gemini client."""
+    if not secrets["gemini_key"]:
         st.error("GEMINI_API_KEY is not set in Streamlit secrets.")
         return None
     try:
-        client = genai.Client(api_key=secrets["gemini_key"])
-        return client
+        return genai.Client(api_key=secrets["gemini_key"])
     except Exception as e:
         st.error(f"Error initializing Gemini client: {e}")
         return None
@@ -90,15 +118,49 @@ def get_gemini_client():
 gemini_client = get_gemini_client()
 
 
-# =======================
+@st.cache_resource
+def get_embeddings():
+    if not secrets["openai_key"]:
+        st.warning("OPENAI_API_KEY is not set; semantic matching will be disabled.")
+        return None
+    try:
+        return OpenAIEmbeddings(openai_api_key=secrets["openai_key"])
+    except Exception as e:
+        st.error(f"Error creating OpenAI embeddings: {e}")
+        return None
+
+
+@st.cache_resource
+def get_vector_store():
+    """
+    Create or load a Chroma vector DB using OpenAI embeddings.
+    This stores all *found* items with metadata.
+    """
+    embeddings = get_embeddings()
+    if embeddings is None:
+        return None
+
+    try:
+        vs = Chroma(
+            collection_name="lost_and_found_items",
+            embedding_function=embeddings,
+            persist_directory="chroma_db",  # local folder for persistence
+        )
+        return vs
+    except Exception as e:
+        st.error(f"Error creating Chroma vector store: {e}")
+        return None
+
+
+vector_store = get_vector_store()
+
+
+# -----------------------
 # SAFE GEMINI HELPERS
-# =======================
+# -----------------------
 
 def safe_send(chat, message_content: str, context: str = ""):
-    """
-    Wrapper for chat.send_message that shows the real Gemini ClientError
-    instead of the redacted Streamlit traceback.
-    """
+    """Wrapper around chat.send_message with clear error reporting."""
     try:
         return chat.send_message(message_content)
     except genai_errors.ClientError as e:
@@ -110,77 +172,30 @@ def safe_send(chat, message_content: str, context: str = ""):
 
 
 def safe_generate(full_prompt: str, context: str = ""):
-    """
-    Wrapper for gemini_client.models.generate_content with clear error reporting.
-    """
+    """Wrapper around generate_content with clear error reporting."""
     if gemini_client is None:
         st.error("Gemini client is not available.")
         st.stop()
-
     try:
-        # Check if the prompt contains image data (not implemented in this mock)
-        contents = full_prompt 
-        
         return gemini_client.models.generate_content(
             model=MODEL_NAME,
-            contents=contents,
+            contents=full_prompt,
         )
     except genai_errors.ClientError as e:
-        label = context or "standardization"
+        label = context or "generation"
         st.error(f"Gemini ClientError during {label}: {e}")
         if getattr(e, "response_json", None):
             st.json(e.response_json)
         st.stop()
 
 
-# =======================
-# OPTIONAL VECTOR STORE (PGVECTOR + OPENAI)
-# =======================
-
-@st.cache_resource
-def get_vector_store():
-    """
-    Try to connect to existing PGVector store using OpenAI Embeddings.
-    """
-    if not secrets["has_pg"]:
-        # Check happens inside get_secrets now, so this catches if the dependency install failed
-        if not HAS_VECTOR_LIBS:
-            st.warning("Vector search disabled: Missing LangChain/OpenAI dependencies.")
-        return None
-
-    if not (secrets["has_openai"] and secrets["has_pg"]):
-        st.warning("Vector search disabled: Missing OpenAI key or PG connection string.")
-        return None
-
-    try:
-        # LangChain PGVector defaults to using OpenAI Embeddings
-        embeddings = OpenAIEmbeddings(openai_api_key=secrets["openai_key"])
-        db = PGVector(
-            connection_string=secrets["pg_conn_string"],
-            embedding_function=embeddings,
-            collection_name=COLLECTION_NAME,
-            # Ensure table creation works if the collection doesn't exist
-            # Note: This is a complex step in production
-            pre_delete_collection=False 
-        )
-        
-        st.success(f"Vector search enabled using collection: {COLLECTION_NAME}")
-        return db
-    except Exception as e:
-        st.error(f"PGVector connection error: {e}. Vector search disabled.")
-        return None
-
-
-vector_store = get_vector_store()
-
-
-# =======================
-# PROMPTS (Reverted)
-# =======================
+# -----------------------
+# PROMPTS
+# -----------------------
 
 GENERATOR_SYSTEM_PROMPT = """
 Role:
-You are a Lost & Found intake operator for a public transit system. Your job is to gather accurate factual information
+You are a Lost & Found intake operator for a public-transit system. Your job is to gather accurate factual information
 about a found item, refine the description interactively with the user, and output a single final structured record.
 
 Behavior Rules:
@@ -284,26 +299,15 @@ Do not output any explanation. Only output the JSON object.
 """
 
 
-# =======================
-# DATA HELPERS
-# =======================
+# -----------------------
+# TAG / DATA HELPERS
+# -----------------------
 
 @st.cache_data
 def load_tag_data():
     """Load Tags.xlsx and prepare tag lists."""
     try:
-        # Create a dummy Tags.xlsx if it doesn't exist for running the code
-        if not os.path.exists("Tags.xlsx"):
-            mock_data = {
-                "Subway Location": ["Times Square", "Union Square", "Grand Central", "null"],
-                "Color": ["Red", "Blue", "Black", "Brown", "Metallic", "null"],
-                "Item Category": ["Electronics", "Bags", "Clothing", "Accessories", "null"],
-                "Item Type": ["Phone", "Backpack", "Wallet", "Jacket", "Keys", "null"],
-            }
-            pd.DataFrame(mock_data).to_excel("Tags.xlsx", index=False)
-            st.info("Created mock 'Tags.xlsx' file for demonstration.")
-            
-        df = pd.read_excel("Tags.xlsx")
+        df = pd.read_excel("Tags.xlsx")  # requires openpyxl
         return {
             "df": df,
             "locations": sorted(set(df["Subway Location"].dropna().astype(str))),
@@ -316,23 +320,19 @@ def load_tag_data():
         return None
 
 
-def extract_field(text: str, field: str) -> str:
-    """Extract a simple `Field: value` line from a structured block."""
-    match = re.search(rf"{field}:\s*(.*)", text)
+def extract_field(text_block: str, field: str) -> str:
+    """Extract 'Field: value' from a structured block."""
+    match = re.search(rf"{field}:\s*(.*)", text_block)
     return match.group(1).strip() if match else "null"
 
 
 def is_structured_record(message: str) -> bool:
-    """Detect if the message looks like the final structured record."""
+    """Detect if a message is the final structured record."""
     return message.strip().startswith("Subway Location:")
 
 
-def standardize_description(text: str, tags: dict) -> dict:
-    """Send structured text plus tag summary to Gemini and parse JSON."""
-    if gemini_client is None:
-        st.error("Gemini client is not available. Cannot standardize description.")
-        return {}
-
+def standardize_description(text_block: str, tags: Dict) -> Dict:
+    """Send structured text + tag summary to Gemini and parse JSON."""
     tags_summary = (
         "\n--- TAGS REFERENCE ---\n"
         f"Subway Location tags: {', '.join(tags['locations'][:50])}\n"
@@ -341,9 +341,8 @@ def standardize_description(text: str, tags: dict) -> dict:
         f"Item Type tags: {', '.join(tags['item_types'][:50])}\n"
     )
 
-    full_prompt = f"{STANDARDIZER_PROMPT}\n\nHere is the structured input to standardize:\n{text}\n{tags_summary}"
+    full_prompt = f"{STANDARDIZER_PROMPT}\n\nHere is the structured input to standardize:\n{text_block}\n{tags_summary}"
 
-    # Use safe_generate so we see real errors
     response = safe_generate(full_prompt, context="standardize_description")
 
     try:
@@ -357,174 +356,30 @@ def standardize_description(text: str, tags: dict) -> dict:
         if "time" not in data or not data["time"]:
             data["time"] = datetime.now(timezone.utc).isoformat()
 
-        # Normalize list-type fields
+        # Normalize lists
         for key in ["subway_location", "color", "item_type"]:
             if key in data and isinstance(data[key], str):
                 data[key] = [data[key]]
-            elif key not in data or data[key] is None:
+            elif key not in data:
                 data[key] = []
-            elif key in data and data[key] == ["null"]:
-                data[key] = []
-                
-        if "item_category" not in data or data["item_category"] is None:
+
+        if "item_category" not in data:
             data["item_category"] = "null"
 
         if "description" not in data:
-            data["description"] = extract_field(text, "Description")
+            data["description"] = extract_field(text_block, "Description")
 
         return data
+
     except Exception:
         st.error("Model output could not be parsed as JSON. Raw output below:")
         st.text(response.text)
         return {}
 
 
-# =======================
-# DATABASE HELPERS (SQLite for metadata and Hybrid Search)
-# =======================
-
-def init_db():
-    with sqlite3.connect("lost_and_found.db") as conn:
-        c = conn.cursor()
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS found_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                caption TEXT,
-                location TEXT,
-                contact TEXT,
-                image_path TEXT,
-                json_data TEXT
-            )
-        """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS lost_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                description TEXT,
-                contact TEXT,
-                email TEXT,
-                json_data TEXT
-            )
-        """
-        )
-        conn.commit()
-
-
-def add_found_item(caption, location, contact, image_path, json_data_string):
-    """
-    Saves item metadata to SQLite and stores embedding in PGVector.
-    """
-    if vector_store is None:
-        st.error("Cannot save: Vector store is not initialized.")
-        return False
-
-    with sqlite3.connect("lost_and_found.db") as conn:
-        # 1. Save metadata to SQLite first
-        c = conn.cursor()
-        c.execute(
-            """
-            INSERT INTO found_items (caption, location, contact, image_path, json_data)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (caption, location, contact, image_path, json_data_string),
-        )
-        item_id = c.lastrowid
-        conn.commit()
-
-        # 2. Extract standardized metadata for PGVector
-        json_data = json.loads(json_data_string)
-        
-        # PGVector requires metadata values to be simple strings/numbers
-        metadata = {
-            "source": "found_item",
-            "sqlite_id": str(item_id), # Link back to the SQLite record
-            "image_path": image_path,
-            "item_category": json_data.get("item_category", "null"),
-            "color": json_data["color"][0] if json_data["color"] else "null", # Use first color for filter
-            "location": json_data["subway_location"][0] if json_data["subway_location"] else "null", # Use first location for filter
-        }
-        
-        # 3. Create document and store embedding in PGVector
-        # Page content is the description which will be embedded
-        doc = Document(
-            page_content=json_data.get("description", caption), 
-            metadata=metadata
-        )
-        vector_store.add_documents([doc])
-        st.success(f"Found item saved as SQLite ID: {item_id} and embedded in PGVector.")
-        return True
-
-
-def add_lost_item(description, contact, email, json_data_string):
-    with sqlite3.connect("lost_and_found.db") as conn:
-        c = conn.cursor()
-        c.execute(
-            """
-            INSERT INTO lost_items (description, contact, email, json_data)
-            VALUES (?, ?, ?, ?);
-            """,
-            (description, contact, email, json_data_string),
-        )
-        conn.commit()
-
-
-def hybrid_match_found_items(lost_item_json: dict, k: int = 3) -> List[Dict[str, Any]]:
-    """
-    Performs Hybrid Search: Metadata Filter (SQL-like) + Vector Search (Cosine).
-    """
-    if vector_store is None:
-        # Fallback needed if vector store isn't running
-        st.warning("Vector store is not available for matching. Returning mock results.")
-        # Mock result for visual display if PGVector is down
-        return [
-            {"score": 0.95, "sqlite_id": 99, "category": "Bags", "color": "Red", "found_description": "Mock Red Backpack, broken zipper.", "image_path": MOCK_IMAGE_URL},
-            {"score": 0.88, "sqlite_id": 98, "category": "Electronics", "color": "Black", "found_description": "Mock Black Phone, cracked screen.", "image_path": MOCK_IMAGE_URL}
-        ]
-
-    # 1. Extract Structured Filters (from standardized LOST item JSON)
-    category_filter = lost_item_json.get("item_category")
-    
-    langchain_filter = {}
-    
-    # Only apply filter if the category is valid (not "null" or empty)
-    if category_filter and category_filter != "null":
-        # LangChain's filter structure for PGVector often uses simple key-value matching
-        # Note: PGVector's filter structure is typically simplified in LangChain
-        # We assume exact match for category for initial filtering efficiency
-        langchain_filter["item_category"] = category_filter
-
-    # The lost item's full description is the query text for vector comparison
-    query_text = lost_item_json.get("description", "")
-    if not query_text:
-        return []
-    
-    st.info(f"Hybrid Search Query: '{query_text[:30]}...' | Filter: {langchain_filter}")
-
-    # 2. Execute Hybrid Search (PGVector handles the filtering internally before similarity)
-    results_with_score = vector_store.similarity_search_with_score(
-        query_text,
-        k=k,
-        filter=langchain_filter
-    )
-
-    # 3. Format results
-    matched_items = []
-    for doc, score in results_with_score:
-        # Note: doc.metadata contains image_path and other tags
-        matched_items.append({
-            "score": round(score, 4),
-            "sqlite_id": doc.metadata.get("sqlite_id", "N/A"),
-            "category": doc.metadata.get("item_category", "N/A"),
-            "color": doc.metadata.get("color", "N/A"),
-            "found_description": doc.page_content,
-            # Use mock image URL if path is missing or invalid
-            "image_path": doc.metadata.get("image_path", MOCK_IMAGE_URL)
-        })
-        
-    return matched_items
-
+# -----------------------
+# SIMPLE VALIDATION HELPERS
+# -----------------------
 
 def validate_phone(phone: str) -> bool:
     return bool(re.fullmatch(r"\d{10}", phone))
@@ -534,99 +389,267 @@ def validate_email(email: str) -> bool:
     return "@" in email and "." in email.split("@")[-1]
 
 
-# =======================
-# STREAMLIT SETUP
-# =======================
+# -----------------------
+# VECTOR STORE HELPERS
+# -----------------------
 
-st.set_page_config(
-    page_title="Lost and Found Intake",
-    page_icon="🧳",
-    layout="wide",
-)
+def get_all_found_items_raw() -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+    """Return raw ids, documents, metadatas from Chroma."""
+    if vector_store is None:
+        return [], [], []
+    try:
+        coll = vector_store._collection
+        data = coll.get()
+        return data.get("ids", []), data.get("documents", []), data.get("metadatas", [])
+    except Exception:
+        return [], [], []
 
-init_db()
 
-st.sidebar.title("Navigation")
+def get_all_found_items_as_df() -> pd.DataFrame:
+    """Pull all 'found' items from Chroma for admin view & metrics."""
+    ids, docs, metas = get_all_found_items_raw()
+    rows: List[Dict[str, Any]] = []
+
+    for id_, doc, meta in zip(ids, docs, metas):
+        if not meta:
+            continue
+        if meta.get("record_type") != "found":
+            continue
+
+        rows.append(
+            {
+                "found_id": meta.get("found_id", id_),
+                "description": meta.get("description", doc),
+                "subway_location": ", ".join(meta.get("subway_location", [])),
+                "color": ", ".join(meta.get("color", [])),
+                "item_category": meta.get("item_category", ""),
+                "item_type": ", ".join(meta.get("item_type", [])),
+                "contact": meta.get("contact", ""),
+                "time": meta.get("time", ""),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def get_next_found_id() -> int:
+    """Generate a simple incremental ID for found items (for display/admin)."""
+    if "next_found_id" not in st.session_state:
+        # Derive from existing items so IDs don't reset
+        df = get_all_found_items_as_df()
+        if df.empty:
+            st.session_state.next_found_id = 1
+        else:
+            st.session_state.next_found_id = int(df["found_id"].max()) + 1
+    nid = st.session_state.next_found_id
+    st.session_state.next_found_id += 1
+    return nid
+
+
+def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
+    """
+    Add a found item into Chroma vector DB with metadata.
+    Returns a local numeric ID.
+    """
+    if vector_store is None:
+        st.error("Vector store is not available; cannot save found item.")
+        return -1
+
+    description = json_data.get("description", "")
+    if not description:
+        st.error("Found item description is empty; cannot embed.")
+        return -1
+
+    found_id = get_next_found_id()
+
+    metadata = {
+        "record_type": "found",
+        "found_id": found_id,
+        "subway_location": json_data.get("subway_location", []),
+        "color": json_data.get("color", []),
+        "item_category": json_data.get("item_category", ""),
+        "item_type": json_data.get("item_type", []),
+        "description": description,
+        "contact": contact,
+        "time": json_data.get("time"),
+    }
+
+    try:
+        vector_store.add_texts(
+            texts=[description],
+            metadatas=[metadata],
+            ids=[str(found_id)],
+        )
+        vector_store.persist()
+        return found_id
+    except Exception as e:
+        st.error(f"Error saving found item to vector store: {e}")
+        return -1
+
+
+def search_matches_for_lost_item(
+    final_json: Dict, top_k: int, max_distance: float
+) -> Tuple[List[Any], List[Any]]:
+    """
+    Use vector DB (Chroma) to search for similar found items.
+    Returns (all_candidates, filtered_by_distance)
+    """
+    if vector_store is None:
+        return [], []
+
+    query_text = final_json.get("description", "")
+    if not query_text:
+        return [], []
+
+    # Optional filter by category
+    filter_dict: Dict[str, Any] = {"record_type": "found"}
+    if final_json.get("item_category") and final_json["item_category"] != "null":
+        filter_dict["item_category"] = final_json["item_category"]
+
+    try:
+        docs_scores = vector_store.similarity_search_with_score(
+            query_text,
+            k=top_k,
+            filter=filter_dict,
+        )
+    except Exception as e:
+        st.error(f"Error during vector search: {e}")
+        docs_scores = []
+
+    filtered = [(doc, score) for doc, score in docs_scores if score <= max_distance]
+    return docs_scores, filtered
+
+
+# -----------------------
+# APP INIT
+# -----------------------
+
+tag_data = load_tag_data()
+if not tag_data:
+    st.stop()
+
+if gemini_client is None:
+    st.stop()
+
+# -----------------------
+# SIDEBAR NAV + MATCHING CONTROLS
+# -----------------------
+
+st.sidebar.title("🧭 Navigation")
+
 page = st.sidebar.radio(
     "Go to",
-    ["Upload Found Item (Operator)", "Report Lost Item (User)"],
+    ["👮 Operator: Upload Found Item", "🧍 User: Report Lost Item", "📊 Admin: View Found Items"],
 )
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔎 Matching Controls")
+
+top_k_sidebar = st.sidebar.slider(
+    "Top-K candidates",
+    min_value=1,
+    max_value=10,
+    value=5,
+    step=1,
+    help="Number of candidate matches to retrieve from the vector DB.",
+)
+
+max_distance_sidebar = st.sidebar.slider(
+    "Max distance (lower = more similar)",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.4,
+    step=0.01,
+    help="Matches with distance greater than this will be filtered out.",
+)
+
+st.sidebar.markdown("---")
+st.sidebar.caption("💡 Tip: Distance is model-dependent. Start with 0.4–0.5 and adjust.")
+
+
+# -----------------------
+# TOP DASHBOARD METRICS
+# -----------------------
+
+df_found_for_metrics = get_all_found_items_as_df()
+total_found = len(df_found_for_metrics)
+
+col_m1, col_m2 = st.columns(2)
+with col_m1:
+    st.markdown('<div class="metric-card"><h3>Total Found Items</h3><p>{}</p></div>'.format(total_found), unsafe_allow_html=True)
+with col_m2:
+    st.markdown(
+        '<div class="metric-card"><h3>Matching Top-K</h3><p>{}</p></div>'.format(top_k_sidebar),
+        unsafe_allow_html=True,
+    )
+
+st.markdown("")  # spacing
+
 
 # ===============================================================
-# OPERATOR SIDE
+# PAGE 1: OPERATOR – UPLOAD FOUND ITEM
 # ===============================================================
 
-if page == "Upload Found Item (Operator)":
-    st.title("Operator View: Upload Found Item")
+if page.startswith("👮"):
+    st.markdown('<div class="main-title">👮 Operator View: Upload Found Item</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtitle">Frontline staff can quickly record what they found, '
+        'then the system standardizes tags and stores it in the vector database for matching later.</div>',
+        unsafe_allow_html=True,
+    )
 
-    tag_data = load_tag_data()
-    if not tag_data:
-        st.stop()
-
-    if gemini_client is None:
-        st.info("Gemini is not available. Automated description is disabled.")
-        st.stop()
-
-    # Start operator chat if needed
     if "operator_chat" not in st.session_state:
         st.session_state.operator_chat = gemini_client.chats.create(
-            model=MODEL_NAME,
+            model= MODEL_NAME,
             config=types.GenerateContentConfig(
                 system_instruction=GENERATOR_SYSTEM_PROMPT,
             ),
         )
         st.session_state.operator_msgs = []
 
-    # Show conversation
+    # Show conversation history
+    if st.session_state.operator_msgs:
+        st.markdown('<div class="section-title">🗨️ Intake Conversation</div>', unsafe_allow_html=True)
     for msg in st.session_state.operator_msgs:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
     # Initial intake
     if not st.session_state.operator_msgs:
-        st.markdown("Start by uploading an image or giving a short description of the found item.")
+        st.markdown('<div class="section-title">➕ Start a New Found Item</div>', unsafe_allow_html=True)
+        with st.container():
+            col1, col2 = st.columns(2)
+            with col1:
+                uploaded_image = st.file_uploader(
+                    "📷 Image of the found item (optional)",
+                    type=["jpg", "jpeg", "png"],
+                    key="operator_image",
+                )
+            with col2:
+                initial_text = st.text_input(
+                    "📝 Short description",
+                    placeholder="For example: black backpack with a NASA patch",
+                    key="operator_text",
+                )
 
-        col1, col2 = st.columns(2)
-        uploaded_image = None
-        initial_text = ""
-        
-        with col1:
-            uploaded_image = st.file_uploader(
-                "Image of the found item (optional)",
-                type=["jpg", "jpeg", "png"],
-                key="operator_image",
-            )
-            # --- MOCK IMAGE PATH ---
-            image_path_to_save = f"mock_storage/found_{datetime.now().strftime('%Y%m%d%H%M%S')}.png" if uploaded_image else MOCK_IMAGE_URL
-            if uploaded_image:
-                 st.image(Image.open(uploaded_image).convert("RGB"), width=200)
-
-        with col2:
-            initial_text = st.text_input(
-                "Short description",
-                placeholder="For example black backpack with a NASA patch",
-                key="operator_text",
-            )
-
-        if st.button("Start Intake"):
+        if st.button("🚀 Start Intake"):
             if not uploaded_image and not initial_text:
                 st.error("Please upload an image or enter a short description.")
             else:
                 message_content = ""
-
                 if uploaded_image:
-                    message_content += "I have a photo of the found item. Here is my description based on what I see: "
-
+                    img = Image.open(uploaded_image).convert("RGB")
+                    st.image(img, width=220, caption="Preview of found item")
+                    message_content += "I have uploaded an image of the found item. "
                 if initial_text:
                     message_content += initial_text
 
                 st.session_state.operator_msgs.append(
                     {"role": "user", "content": message_content}
                 )
-                with st.spinner("Analyzing item"):
-                    # For VLM tasks, you should pass the image data to Gemini, 
-                    # but for chat-only LLM (gemini-2.0-flash) we send the text description.
+                with st.spinner("Analyzing item with Gemini..."):
                     response = safe_send(
                         st.session_state.operator_chat,
                         message_content,
@@ -635,18 +658,15 @@ if page == "Upload Found Item (Operator)":
                 st.session_state.operator_msgs.append(
                     {"role": "model", "content": response.text}
                 )
-                
-                # Store the image path temporarily for saving later
-                st.session_state.operator_image_path = image_path_to_save 
                 st.rerun()
 
     # Continue chat
-    operator_input = st.chat_input("Add more details or say 'done' when ready")
+    operator_input = st.chat_input("Add more details for the operator bot, or say 'done' when ready.")
     if operator_input:
         st.session_state.operator_msgs.append(
             {"role": "user", "content": operator_input}
         )
-        with st.spinner("Processing"):
+        with st.spinner("Processing operator message..."):
             response = safe_send(
                 st.session_state.operator_chat,
                 operator_input,
@@ -657,77 +677,57 @@ if page == "Upload Found Item (Operator)":
         )
         st.rerun()
 
-    # Check for final structured record
+    # When final structured record appears
     if st.session_state.operator_msgs and is_structured_record(
         st.session_state.operator_msgs[-1]["content"]
     ):
         structured_text = st.session_state.operator_msgs[-1]["content"]
-        st.markdown("### Final structured description")
+        st.markdown('<div class="section-title">📦 Final Structured Description</div>', unsafe_allow_html=True)
         st.code(structured_text)
 
         final_json = standardize_description(structured_text, tag_data)
         if final_json:
-            st.success("Standardized JSON")
+            st.markdown('<div class="section-title">🏷️ Standardized Tags (JSON)</div>', unsafe_allow_html=True)
             st.json(final_json)
 
-            contact = st.text_input("Operator contact or badge")
-            if st.button("Save Found Item"):
-                if not contact:
-                    st.error("Please enter operator contact.")
-                else:
-                    location_value = (
-                        final_json["subway_location"][0]
-                        if final_json.get("subway_location")
-                        else ""
-                    )
-                    success = add_found_item(
-                        final_json.get("description", ""),
-                        location_value,
-                        contact,
-                        st.session_state.get("operator_image_path", MOCK_IMAGE_URL), # Use path from session state
-                        json.dumps(final_json),
-                    )
-                    if success:
-                         st.session_state.operator_msgs = [] # Clear chat on success
-                         st.rerun()
+            st.markdown('<div class="section-title">👤 Operator Contact</div>', unsafe_allow_html=True)
+            contact = st.text_input("Operator contact or badge ID")
+
+            if st.button("💾 Save Found Item to Vector DB"):
+                found_id = save_found_item_to_vectorstore(final_json, contact)
+                if found_id > 0:
+                    st.success(f"Found item saved with ID `{found_id}` (Chroma vector DB).")
 
 
 # ===============================================================
-# USER SIDE: INTEGRATED MATCHING
+# PAGE 2: USER – REPORT LOST ITEM & MATCH
 # ===============================================================
 
-if page == "Report Lost Item (User)":
-    st.title("Report Lost Item (User) - Matching Enabled")
+if page.startswith("🧍"):
+    st.markdown('<div class="main-title">🧍 User View: Report Lost Item</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtitle">Riders describe what they lost. The system standardizes their description '
+        'and searches for similar found items using embeddings.</div>',
+        unsafe_allow_html=True,
+    )
 
-    tag_data = load_tag_data()
-    if not tag_data:
-        st.stop()
-
-    if gemini_client is None:
-        st.info("Gemini is not available. Automated structuring is disabled.")
-        st.stop()
-
-    st.markdown("You can give quick info using dropdowns, then refine with chat.")
-
-    # --- Quick Info Dropdowns ---
-    with st.expander("Optional quick info"):
+    st.markdown('<div class="section-title">⚡ Optional Quick Info</div>', unsafe_allow_html=True)
+    with st.expander("Click to pre-select station / category / type"):
         col1, col2, col3 = st.columns(3)
         with col1:
             location_choice = st.selectbox(
-                "Subway station (optional)", [""] + tag_data["locations"]
+                "🚉 Subway station (optional)", [""] + tag_data["locations"]
             )
         with col2:
             category_choice = st.selectbox(
-                "Item category (optional)", [""] + tag_data["categories"]
+                "📂 Item category (optional)", [""] + tag_data["categories"]
             )
         with col3:
             type_choice = st.selectbox(
-                "Item type (optional)", [""] + tag_data["item_types"]
+                "🔖 Item type (optional)", [""] + tag_data["item_types"]
             )
-    # ---------------------------
 
-    st.subheader("Describe or show your lost item")
-
+    st.markdown('<div class="section-title">📷 / 📝 Describe Your Lost Item</div>', unsafe_allow_html=True)
     col_img, col_text = st.columns(2)
     with col_img:
         uploaded_image = st.file_uploader(
@@ -738,11 +738,10 @@ if page == "Report Lost Item (User)":
     with col_text:
         initial_text = st.text_input(
             "Short description",
-            placeholder="For example blue iPhone with cracked screen",
+            placeholder="For example: blue iPhone with cracked screen",
             key="user_text",
         )
 
-    # Start user chat if needed
     if "user_chat" not in st.session_state:
         st.session_state.user_chat = gemini_client.chats.create(
             model=MODEL_NAME,
@@ -753,30 +752,29 @@ if page == "Report Lost Item (User)":
         st.session_state.user_msgs = []
 
     # Show chat history
+    if st.session_state.user_msgs:
+        st.markdown('<div class="section-title">🗨️ Chat with the Lost-Item Assistant</div>', unsafe_allow_html=True)
     for msg in st.session_state.user_msgs:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
     # Start report
-    if not st.session_state.user_msgs and st.button("Start Report"):
+    if not st.session_state.user_msgs and st.button("🚀 Start Lost Item Report"):
         if not uploaded_image and not initial_text:
             st.error("Please upload an image or enter a short description.")
         else:
             message_text = ""
             if uploaded_image:
                 image = Image.open(uploaded_image).convert("RGB")
-                st.image(image, width=250)
+                st.image(image, width=240, caption="Your lost item (preview)")
                 message_text += "I have uploaded an image of my lost item. "
-
             if initial_text:
                 message_text += initial_text
 
             st.session_state.user_msgs.append(
                 {"role": "user", "content": message_text}
             )
-            with st.spinner("Analyzing"):
-                # NOTE: If using a VLM here (like gemini-2.5-flash-preview-09-2025), 
-                # you should pass the image object/bytes in the contents list.
+            with st.spinner("Analyzing your description..."):
                 response = safe_send(
                     st.session_state.user_chat,
                     message_text,
@@ -788,12 +786,12 @@ if page == "Report Lost Item (User)":
             st.rerun()
 
     # Continue chat
-    user_input = st.chat_input("Add more details or say 'done' when ready")
+    user_input = st.chat_input("Add more details, answer questions, or say 'done' when ready.")
     if user_input:
         st.session_state.user_msgs.append(
             {"role": "user", "content": user_input}
         )
-        with st.spinner("Thinking"):
+        with st.spinner("Thinking..."):
             response = safe_send(
                 st.session_state.user_chat,
                 user_input,
@@ -810,98 +808,111 @@ if page == "Report Lost Item (User)":
     ):
         structured_text = st.session_state.user_msgs[-1]["content"]
 
-        # 1. Merge dropdown choices with LLM output
+        st.markdown('<div class="section-title">🧩 Final Structured Record (Before Standardization)</div>', unsafe_allow_html=True)
         merged_text = f"""
 Subway Location: {location_choice or extract_field(structured_text, 'Subway Location')}
 Color: {extract_field(structured_text, 'Color')}
 Item Category: {category_choice or extract_field(structured_text, 'Item Category')}
-Item Type: {type_choice or extract_field(structured_text, 'Item Type')}<br>
+Item Type: {type_choice or extract_field(structured_text, 'Item Type')}
 Description: {extract_field(structured_text, 'Description')}
         """
+        st.code(merged_text)
 
-        st.markdown("### 1. Standardizing Record")
         final_json = standardize_description(merged_text, tag_data)
         if final_json:
-            st.success("Standardized record created.")
+            st.markdown('<div class="section-title">🏷️ Standardized Lost Item</div>', unsafe_allow_html=True)
             st.json(final_json)
 
-            # 2. MATCHING WORKSTREAM (Hybrid Search)
-            st.markdown("### 2. Searching for Found Items (Hybrid Match)")
-            
-            # Check if vector search is even possible
-            if vector_store is None:
-                st.error("Cannot perform matching: Vector store not configured.")
-                # Show mock results even if real PGVector isn't running
-                matched_items = hybrid_match_found_items(final_json, k=3)
-            else:
-                with st.spinner("Executing Hybrid Vector Search..."):
-                    # Calling the Hybrid Match function
-                    matched_items = hybrid_match_found_items(final_json, k=3)
-                
-            if matched_items:
-                st.success(f"Found {len(matched_items)} potential matches!")
-                
-                # Display the matched items
-                for i, match in enumerate(matched_items):
-                    st.markdown(f"**Match #{i+1} (Confidence: {match['score']:.4f})**")
-                    
-                    col_score, col_details, col_image = st.columns([1, 3, 1])
-                    
-                    with col_details:
-                        st.write(f"DB ID: {match['sqlite_id']}")
-                        st.caption(f"Category: {match['category']}, Color: {match['color']}")
-                        st.write(f"Found Description: {match['found_description']}")
-                        
-                    with col_image:
-                        # Display a mock image based on the path stored in PGVector metadata
-                        # Use the placeholder image URL for the mock path
-                        img_path = match['image_path'] if match['image_path'] else MOCK_IMAGE_URL
-                        st.image(img_path, caption=f"ID: {match['sqlite_id']}")
-                        
-                    st.markdown("---")
-                    
-            else:
-                st.info("No high-confidence matches found.")
-
-
-            # 3. CONTACT AND SUBMISSION
-            st.markdown("### 3. Contact information")
-            contact = st.text_input("Phone number, ten digits")
+            st.markdown('<div class="section-title">📇 Contact Information</div>', unsafe_allow_html=True)
+            contact = st.text_input("Phone number (10 digits, numbers only)")
             email = st.text_input("Email address")
 
-            if st.button("Submit Lost Item Report"):
+            st.info("Your contact is only used to follow up if a strong match is found.")
+
+            if st.button("🔍 Submit & Search for Matches"):
                 if not validate_phone(contact):
-                    st.error("Please enter a ten digit phone number without spaces.")
+                    st.error("Please enter a ten digit phone number (no spaces).")
                 elif not validate_email(email):
                     st.error("Please enter a valid email address.")
                 else:
-                    add_lost_item(
-                        final_json.get("description", ""),
-                        contact,
-                        email,
-                        json.dumps(final_json),
-                    )
-                    st.success("Lost item report submitted and potential matches identified.")
-                    st.session_state.user_msgs = []
-                    st.rerun()
+                    st.success("Lost item report received (not stored permanently in DB for this demo).")
 
-    # Optional vector search debug panel
-    with st.expander("Vector search (debug)"):
-        if vector_store is None:
-            st.info("Vector search is not configured or not available.")
-        else:
-            query = st.text_input("Search similar descriptions")
-            if query:
-                with st.spinner("Searching similar items"):
-                    try:
-                        # Direct vector search without metadata filter
-                        results = vector_store.similarity_search_with_score(
-                            query, k=3
+                    if vector_store is None:
+                        st.info(
+                            "Vector store is not configured, so no matches can be shown yet."
                         )
-                        for doc, score in results:
-                            st.write(f"Score: {score:.4f}")
-                            st.write(doc.page_content)
-                            st.markdown(f"Metadata: {doc.metadata}")
-                            st.markdown("---")
-                    except Exception as e:
-                        st.error(f"Error during vector search: {e}")
+                    else:
+                        with st.spinner(
+                            "Searching for similar found items using embeddings..."
+                        ):
+                            all_candidates, filtered = search_matches_for_lost_item(
+                                final_json,
+                                top_k=top_k_sidebar,
+                                max_distance=max_distance_sidebar,
+                            )
+
+                        if not all_candidates:
+                            st.info(
+                                "No items are stored in the vector DB yet, so no matches can be returned."
+                            )
+                        else:
+                            st.markdown('<div class="section-title">📌 Candidate Matches</div>', unsafe_allow_html=True)
+
+                            if not filtered:
+                                st.info(
+                                    "No matches under the current distance threshold. "
+                                    "Showing raw top-K candidates instead."
+                                )
+                                to_show = all_candidates
+                            else:
+                                to_show = filtered
+
+                            for doc, score in to_show:
+                                meta = doc.metadata or {}
+                                similarity_pct = max(0.0, (1.0 - score) * 100.0)
+
+                                st.markdown(
+                                    f"**Distance:** `{score:.4f}`  ·  "
+                                    f"**Similarity (approx):** `{similarity_pct:.1f}%`"
+                                )
+
+                                st.write("**Description:**", meta.get("description", doc.page_content))
+
+                                if meta.get("subway_location"):
+                                    st.write(
+                                        "🚉 Location:", ", ".join(meta["subway_location"])
+                                    )
+                                if meta.get("color"):
+                                    st.write("🎨 Color:", ", ".join(meta["color"]))
+                                if meta.get("item_category"):
+                                    st.write("📂 Category:", meta["item_category"])
+                                if meta.get("item_type"):
+                                    st.write("🔖 Type:", ", ".join(meta["item_type"]))
+
+                                st.caption(f"Found item ID: {meta.get('found_id', 'N/A')} · Time: {meta.get('time', '')}")
+                                with st.expander("View raw metadata"):
+                                    st.json(meta)
+                                st.markdown("---")
+
+
+# ===============================================================
+# PAGE 3: ADMIN – VIEW FOUND ITEMS
+# ===============================================================
+
+if page.startswith("📊"):
+    st.markdown('<div class="main-title">📊 Admin: View Stored Found Items</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtitle">Quick view of everything operators have logged into the vector DB.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if vector_store is None:
+        st.error("Vector store is not available.")
+    else:
+        df_found = get_all_found_items_as_df()
+        if df_found.empty:
+            st.info("No found items stored yet.")
+        else:
+            st.markdown('<div class="section-title">📦 Found Items Table</div>', unsafe_allow_html=True)
+            st.dataframe(df_found, use_container_width=True)
+            st.caption("Scroll horizontally to see all columns.")
