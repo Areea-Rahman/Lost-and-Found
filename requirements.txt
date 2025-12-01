@@ -7,4 +7,5 @@ sqlalchemy
 psycopg2-binary
 langchain-community
 langchain-openai
+chromadb
 pgvector
