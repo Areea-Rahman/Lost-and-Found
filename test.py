@@ -477,7 +477,7 @@ def get_next_found_id() -> int:
 def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
     """
     Add a found item into Chroma vector DB with metadata.
-    FIXED: Implements aggressive type conversion to ensure no lists/dicts are passed.
+    FIXED: Implements aggressive type conversion and LangChain metadata utility.
     """
     if vector_store is None:
         st.error("Vector store is not available; cannot save found item.")
@@ -490,13 +490,20 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
 
     found_id = get_next_found_id()
 
-    # 1. Prepare Metadata (This dictionary will be passed to Chroma)
-    metadata = {}
+    # 1. Start with the metadata structure and aggressively flatten all values
+    metadata_base = {
+        "record_type": "found",
+        "found_id": str(found_id),
+        "image_path": MOCK_IMAGE_URL, 
+        "contact": contact,
+        "time": json.dumps(json_data.get("time")), 
+    }
     
-    # 2. Iterate through ALL keys/values in the final_json
+    # 2. Add all fields from final_json, aggressively converting lists/complex types to strings
+    metadata = {}
     for key, value in json_data.items():
         if isinstance(value, list):
-            # FIXED: Convert list to comma-separated string for vector store metadata
+            # Convert list to comma-separated string for vector store metadata
             metadata[key] = ", ".join(map(str, value))
         elif isinstance(value, (str, int, float, bool)) or value is None:
             # Simple primitive types are fine
@@ -505,15 +512,17 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
             # Fallback: Convert any unexpected complex type (like dicts) to JSON string
             metadata[key] = json.dumps(value) 
 
-    # 3. Add essential, un-standardized metadata
-    metadata["record_type"] = "found"
-    metadata["found_id"] = str(found_id)
-    metadata["image_path"] = MOCK_IMAGE_URL
-    metadata["contact"] = contact
-    
-    # 4. Filter complex metadata using LangChain's built-in utility (EXTRA LAYER OF DEFENSE)
-    # This utility is designed to catch residual complex types and convert them to strings/omit them
-    metadata = filter_complex_metadata(metadata)
+    # 3. Merge base metadata back in
+    metadata.update(metadata_base)
+
+    # 4. Filter complex metadata using LangChain's built-in utility (FINAL GUARANTEE)
+    # This utility is the recommended way to clean metadata before upserting.
+    try:
+        metadata = filter_complex_metadata(metadata)
+    except Exception as e:
+        st.error(f"Failed to run LangChain filter_complex_metadata: {e}")
+        return -1
+
 
     try:
         # 5. Store the document and its clean metadata in Chroma
@@ -571,10 +580,11 @@ def search_matches_for_lost_item(
     # 2. Execute Hybrid Search
     # similarity_search_with_score returns a list of tuples: (Document, score)
     try:
+        # FIX: Changed 'where=' back to the correct standard 'filter=' argument name
         docs_scores = vector_store.similarity_search_with_score(
             query_text,
             k=top_k,
-            where=langchain_filter # Use 'where' for metadata filtering in Chroma
+            filter=langchain_filter 
         )
     except Exception as e:
         st.error(f"Error during vector search query: {e}")
