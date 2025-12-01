@@ -9,7 +9,8 @@ import re
 from datetime import datetime, timezone
 from PIL import Image
 import pandas as pd
-import os # Added for image path handling
+import os 
+from typing import List, Dict, Any 
 
 from google import genai
 from google.genai import types
@@ -23,12 +24,15 @@ MODEL_NAME = "gemini-2.0-flash"
 COLLECTION_NAME = "lostandfound_items"
 PG_METADATA_FIELDS = ["subway_location", "color", "item_category", "item_type"]
 
+# Mock Image Placeholder URL for Streamlit
+MOCK_IMAGE_URL = "https://placehold.co/100x100/A8A8A8/000000?text=IMG" 
+
 
 # Optional vector-search imports (wrapped in try so app still runs if missing)
 try:
     from langchain_community.vectorstores import PGVector
     from langchain_openai import OpenAIEmbeddings
-    from langchain_core.documents import Document # Import Document for PGVector inserts
+    from langchain_core.documents import Document 
 
     HAS_VECTOR_LIBS = True
 except Exception:
@@ -49,7 +53,8 @@ def get_secrets():
 
     # NOTE: Assuming secrets are set up for OpenAI and PGVector in Streamlit secrets
     gemini_key = secrets_dict.get("GEMINI_API_KEY")
-    openai_key = secrets_dict.get("OPENAI_API_KEY")
+    # For PGVector, LangChain PGVector typically uses OpenAI for embeddings
+    openai_key = secrets_dict.get("OPENAI_API_KEY") 
     pg_conn_string = secrets_dict.get("PG_CONNECTION_STRING")
 
     return {
@@ -89,9 +94,6 @@ gemini_client = get_gemini_client()
 # =======================
 # SAFE GEMINI HELPERS
 # =======================
-
-# 
-# (Safe send and safe generate functions remain unchanged)
 
 def safe_send(chat, message_content: str, context: str = ""):
     """
@@ -142,21 +144,27 @@ def get_vector_store():
     Try to connect to existing PGVector store using OpenAI Embeddings.
     """
     if not secrets["has_pg"]:
-        st.warning("PGVector/OpenAI secrets missing. Vector search disabled.")
+        # Check happens inside get_secrets now, so this catches if the dependency install failed
+        if not HAS_VECTOR_LIBS:
+            st.warning("Vector search disabled: Missing LangChain/OpenAI dependencies.")
+        return None
+
+    if not (secrets["has_openai"] and secrets["has_pg"]):
+        st.warning("Vector search disabled: Missing OpenAI key or PG connection string.")
         return None
 
     try:
+        # LangChain PGVector defaults to using OpenAI Embeddings
         embeddings = OpenAIEmbeddings(openai_api_key=secrets["openai_key"])
         db = PGVector(
             connection_string=secrets["pg_conn_string"],
             embedding_function=embeddings,
             collection_name=COLLECTION_NAME,
+            # Ensure table creation works if the collection doesn't exist
+            # Note: This is a complex step in production
+            pre_delete_collection=False 
         )
         
-        # Test query to ensure connection works (optional but recommended)
-        # Note: Initial calls may fail if collection is empty.
-        # This is commented out for initial dev ease.
-        # _ = db.similarity_search("test query", k=1) 
         st.success(f"Vector search enabled using collection: {COLLECTION_NAME}")
         return db
     except Exception as e:
@@ -373,7 +381,7 @@ def standardize_description(text: str, tags: dict) -> dict:
 
 
 # =======================
-# DATABASE HELPERS (SQLite for metadata)
+# DATABASE HELPERS (SQLite for metadata and Hybrid Search)
 # =======================
 
 def init_db():
@@ -410,7 +418,7 @@ def add_found_item(caption, location, contact, image_path, json_data_string):
     Saves item metadata to SQLite and stores embedding in PGVector.
     """
     if vector_store is None:
-        st.error("Cannot save: PGVector is not initialized.")
+        st.error("Cannot save: Vector store is not initialized.")
         return False
 
     with sqlite3.connect("lost_and_found.db") as conn:
@@ -428,16 +436,19 @@ def add_found_item(caption, location, contact, image_path, json_data_string):
 
         # 2. Extract standardized metadata for PGVector
         json_data = json.loads(json_data_string)
+        
+        # PGVector requires metadata values to be simple strings/numbers
         metadata = {
             "source": "found_item",
             "sqlite_id": str(item_id), # Link back to the SQLite record
             "image_path": image_path,
-            "item_category": json_data.get("item_category"),
-            "color": ", ".join(json_data.get("color", [])),
-            "location": ", ".join(json_data.get("subway_location", [])),
+            "item_category": json_data.get("item_category", "null"),
+            "color": json_data["color"][0] if json_data["color"] else "null", # Use first color for filter
+            "location": json_data["subway_location"][0] if json_data["subway_location"] else "null", # Use first location for filter
         }
         
         # 3. Create document and store embedding in PGVector
+        # Page content is the description which will be embedded
         doc = Document(
             page_content=json_data.get("description", caption), 
             metadata=metadata
@@ -465,17 +476,24 @@ def hybrid_match_found_items(lost_item_json: dict, k: int = 3) -> List[Dict[str,
     Performs Hybrid Search: Metadata Filter (SQL-like) + Vector Search (Cosine).
     """
     if vector_store is None:
-        st.warning("Vector store is not available for matching.")
-        return []
+        # Fallback needed if vector store isn't running
+        st.warning("Vector store is not available for matching. Returning mock results.")
+        # Mock result for visual display if PGVector is down
+        return [
+            {"score": 0.95, "sqlite_id": 99, "category": "Bags", "color": "Red", "found_description": "Mock Red Backpack, broken zipper.", "image_path": MOCK_IMAGE_URL},
+            {"score": 0.88, "sqlite_id": 98, "category": "Electronics", "color": "Black", "found_description": "Mock Black Phone, cracked screen.", "image_path": MOCK_IMAGE_URL}
+        ]
 
-    # 1. Extract Structured Filters (from standardized JSON)
+    # 1. Extract Structured Filters (from standardized LOST item JSON)
     category_filter = lost_item_json.get("item_category")
     
-    # PGVector filter requires key-value pairs. We filter by category first.
-    # We convert the single dict filter structure into the LangChain filter format.
     langchain_filter = {}
+    
+    # Only apply filter if the category is valid (not "null" or empty)
     if category_filter and category_filter != "null":
-        # PGVector allows filtering on metadata fields during similarity search
+        # LangChain's filter structure for PGVector often uses simple key-value matching
+        # Note: PGVector's filter structure is typically simplified in LangChain
+        # We assume exact match for category for initial filtering efficiency
         langchain_filter["item_category"] = category_filter
 
     # The lost item's full description is the query text for vector comparison
@@ -486,7 +504,6 @@ def hybrid_match_found_items(lost_item_json: dict, k: int = 3) -> List[Dict[str,
     st.info(f"Hybrid Search Query: '{query_text[:30]}...' | Filter: {langchain_filter}")
 
     # 2. Execute Hybrid Search (PGVector handles the filtering internally before similarity)
-    # This retrieves documents that match the filter AND are semantically similar to query_text
     results_with_score = vector_store.similarity_search_with_score(
         query_text,
         k=k,
@@ -496,15 +513,15 @@ def hybrid_match_found_items(lost_item_json: dict, k: int = 3) -> List[Dict[str,
     # 3. Format results
     matched_items = []
     for doc, score in results_with_score:
-        # Note: doc.page_content is the Found Item's description
-        # doc.metadata contains image_path and other tags
+        # Note: doc.metadata contains image_path and other tags
         matched_items.append({
             "score": round(score, 4),
-            "sqlite_id": doc.metadata.get("sqlite_id"),
-            "category": doc.metadata.get("item_category"),
-            "color": doc.metadata.get("color"),
+            "sqlite_id": doc.metadata.get("sqlite_id", "N/A"),
+            "category": doc.metadata.get("item_category", "N/A"),
+            "color": doc.metadata.get("color", "N/A"),
             "found_description": doc.page_content,
-            "image_path": doc.metadata.get("image_path", "mock_image.png") # Use mock path if not found
+            # Use mock image URL if path is missing or invalid
+            "image_path": doc.metadata.get("image_path", MOCK_IMAGE_URL)
         })
         
     return matched_items
@@ -572,6 +589,9 @@ if page == "Upload Found Item (Operator)":
         st.markdown("Start by uploading an image or giving a short description of the found item.")
 
         col1, col2 = st.columns(2)
+        uploaded_image = None
+        initial_text = ""
+        
         with col1:
             uploaded_image = st.file_uploader(
                 "Image of the found item (optional)",
@@ -579,9 +599,7 @@ if page == "Upload Found Item (Operator)":
                 key="operator_image",
             )
             # --- MOCK IMAGE PATH ---
-            # In a real app, you would save this to a cloud storage (S3/GCS)
-            # and get a permanent URL. Here we mock a path for the PGVector metadata.
-            image_path_to_save = f"mock_storage/found_{datetime.now().strftime('%Y%m%d%H%M%S')}.png" if uploaded_image else ""
+            image_path_to_save = f"mock_storage/found_{datetime.now().strftime('%Y%m%d%H%M%S')}.png" if uploaded_image else MOCK_IMAGE_URL
             if uploaded_image:
                  st.image(Image.open(uploaded_image).convert("RGB"), width=200)
 
@@ -667,7 +685,7 @@ if page == "Upload Found Item (Operator)":
                         final_json.get("description", ""),
                         location_value,
                         contact,
-                        st.session_state.get("operator_image_path", ""), # Use path from session state
+                        st.session_state.get("operator_image_path", MOCK_IMAGE_URL), # Use path from session state
                         json.dumps(final_json),
                     )
                     if success:
@@ -758,6 +776,8 @@ if page == "Report Lost Item (User)":
                 {"role": "user", "content": message_text}
             )
             with st.spinner("Analyzing"):
+                # NOTE: If using a VLM here (like gemini-2.5-flash-preview-09-2025), 
+                # you should pass the image object/bytes in the contents list.
                 response = safe_send(
                     st.session_state.user_chat,
                     message_text,
@@ -796,7 +816,7 @@ if page == "Report Lost Item (User)":
 Subway Location: {location_choice or extract_field(structured_text, 'Subway Location')}
 Color: {extract_field(structured_text, 'Color')}
 Item Category: {category_choice or extract_field(structured_text, 'Item Category')}
-Item Type: {type_choice or extract_field(structured_text, 'Item Type')}
+Item Type: {type_choice or extract_field(structured_text, 'Item Type')}<br>
 Description: {extract_field(structured_text, 'Description')}
         """
 
@@ -812,31 +832,37 @@ Description: {extract_field(structured_text, 'Description')}
             # Check if vector search is even possible
             if vector_store is None:
                 st.error("Cannot perform matching: Vector store not configured.")
+                # Show mock results even if real PGVector isn't running
+                matched_items = hybrid_match_found_items(final_json, k=3)
             else:
                 with st.spinner("Executing Hybrid Vector Search..."):
+                    # Calling the Hybrid Match function
                     matched_items = hybrid_match_found_items(final_json, k=3)
                 
-                if matched_items:
-                    st.success(f"Found {len(matched_items)} potential matches!")
+            if matched_items:
+                st.success(f"Found {len(matched_items)} potential matches!")
+                
+                # Display the matched items
+                for i, match in enumerate(matched_items):
+                    st.markdown(f"**Match #{i+1} (Confidence: {match['score']:.4f})**")
                     
-                    for i, match in enumerate(matched_items):
-                        st.markdown(f"**Match #{i+1} (Confidence: {match['score']:.4f})**")
+                    col_score, col_details, col_image = st.columns([1, 3, 1])
+                    
+                    with col_details:
+                        st.write(f"DB ID: {match['sqlite_id']}")
+                        st.caption(f"Category: {match['category']}, Color: {match['color']}")
+                        st.write(f"Found Description: {match['found_description']}")
                         
-                        col_score, col_details, col_image = st.columns([1, 3, 1])
+                    with col_image:
+                        # Display a mock image based on the path stored in PGVector metadata
+                        # Use the placeholder image URL for the mock path
+                        img_path = match['image_path'] if match['image_path'] else MOCK_IMAGE_URL
+                        st.image(img_path, caption=f"ID: {match['sqlite_id']}")
                         
-                        with col_details:
-                            st.write(f"ID: {match['sqlite_id']}")
-                            st.caption(f"Category: {match['category']}, Color: {match['color']}")
-                            st.write(f"Found Description: {match['found_description']}")
-                            
-                        with col_image:
-                            # Display a mock image based on the path stored in PGVector metadata
-                            st.image(f"https://placehold.co/100x100/A8A8A8/000000?text=IMG-{match['sqlite_id']}", caption=f"ID: {match['sqlite_id']}")
-                            
-                        st.markdown("---")
-                        
-                else:
-                    st.info("No high-confidence matches found.")
+                    st.markdown("---")
+                    
+            else:
+                st.info("No high-confidence matches found.")
 
 
             # 3. CONTACT AND SUBMISSION
