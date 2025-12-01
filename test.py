@@ -237,6 +237,7 @@ Clarification:
 Then ask two to four short follow up questions to collect details such as:
 color if unclear, brand or logo, contents if it is a bag, any writing, where it was lost,
 and approximate time.
+*FINALIZATION RULE*: If the user explicitly states "done", "no more information", "that's all", or "stop asking", immediately output the final structured record using all gathered information.
 
 When you have enough information, output only this structured record:
 
@@ -250,9 +251,7 @@ Do not include your questions or reasoning in the final structured record.
 """
 
 STANDARDIZER_PROMPT = """
-You are the Lost and Found Data Standardizer for a public transit system.
-You receive structured text from another model describing an item.
-Your task is to map free text fields to standardized tag values and produce a clean JSON record.
+You are the Lost and Found Data Standardizer for a public transit system.<br>You receive structured text from another model describing an item.<br>Your task is to map free text fields to standardized tag values and produce a clean JSON record.
 
 Tag Source:
 All valid standardized values are in the provided Tags Excel reference summary.
@@ -489,17 +488,19 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
     found_id = get_next_found_id()
 
     # 1. Prepare Metadata (Convert all list fields to comma-separated strings)
+    # The Chroma vector store requires primitive types (str, int, float, bool)
     metadata = {
         "record_type": "found",
         "found_id": str(found_id),
         "image_path": MOCK_IMAGE_URL, # Using mock URL for now
         
-        # --- FIX APPLIED HERE: CONVERTING LISTS TO STRINGS ---
+        # --- FIX: CONVERTING LIST FIELDS TO COMMA-SEPARATED STRINGS ---
+        # This resolves the error: "Expected metadata value to be a str... got list"
         "subway_location": ", ".join(json_data.get("subway_location", [])),
         "color": ", ".join(json_data.get("color", [])),
         "item_category": json_data.get("item_category", "null"),
         "item_type": ", ".join(json_data.get("item_type", [])),
-        # ----------------------------------------------------
+        # ----------------------------------------------------------------
         
         "description": description,
         "contact": contact,
