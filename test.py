@@ -598,6 +598,12 @@ def search_matches_for_lost_item(
 if not os.path.exists("Tags.xlsx"):
     load_tag_data()
 
+# --- FIX: Call load_tag_data() at the top level to define tag_data globally ---
+tag_data = load_tag_data()
+if not tag_data:
+    st.stop()
+
+
 # Ensure database tables exist
 # (SQLite is only used for metadata persistence outside of the vector store here)
 with sqlite3.connect("lost_and_found.db") as conn:
