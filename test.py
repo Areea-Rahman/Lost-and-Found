@@ -4,6 +4,8 @@
 
 import json
 import re
+import sqlite3
+import os 
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
 
@@ -17,6 +19,7 @@ from google.genai import errors as genai_errors
 
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document 
 
 
 # -----------------------
@@ -24,12 +27,8 @@ from langchain_community.vectorstores import Chroma
 # -----------------------
 
 MODEL_NAME = "gemini-2.0-flash"
+MOCK_IMAGE_URL = "https://placehold.co/100x100/A8A8A8/000000?text=IMG" 
 
-st.set_page_config(
-    page_title="Lost & Found Intake",
-    page_icon="🧳",
-    layout="wide",
-)
 
 # Simple custom CSS for nicer cards / headers
 st.markdown(
@@ -124,6 +123,7 @@ def get_embeddings():
         st.warning("OPENAI_API_KEY is not set; semantic matching will be disabled.")
         return None
     try:
+        # Note: Chroma defaults to using the passed embedding function
         return OpenAIEmbeddings(openai_api_key=secrets["openai_key"])
     except Exception as e:
         st.error(f"Error creating OpenAI embeddings: {e}")
@@ -146,6 +146,7 @@ def get_vector_store():
             embedding_function=embeddings,
             persist_directory="chroma_db",  # local folder for persistence
         )
+        st.success("Chroma vector store initialized.")
         return vs
     except Exception as e:
         st.error(f"Error creating Chroma vector store: {e}")
@@ -307,7 +308,18 @@ Do not output any explanation. Only output the JSON object.
 def load_tag_data():
     """Load Tags.xlsx and prepare tag lists."""
     try:
-        df = pd.read_excel("Tags.xlsx")  # requires openpyxl
+        # Create a dummy Tags.xlsx if it doesn't exist for running the code
+        if not os.path.exists("Tags.xlsx"):
+            mock_data = {
+                "Subway Location": ["Times Square", "Union Square", "Grand Central", "null"],
+                "Color": ["Red", "Blue", "Black", "Brown", "Metallic", "null"],
+                "Item Category": ["Electronics", "Bags", "Clothing", "Accessories", "null"],
+                "Item Type": ["Phone", "Backpack", "Wallet", "Jacket", "Keys", "null"],
+            }
+            pd.DataFrame(mock_data).to_excel("Tags.xlsx", index=False)
+            st.info("Created mock 'Tags.xlsx' file for demonstration.")
+            
+        df = pd.read_excel("Tags.xlsx")
         return {
             "df": df,
             "locations": sorted(set(df["Subway Location"].dropna().astype(str))),
@@ -333,6 +345,10 @@ def is_structured_record(message: str) -> bool:
 
 def standardize_description(text_block: str, tags: Dict) -> Dict:
     """Send structured text + tag summary to Gemini and parse JSON."""
+    if gemini_client is None:
+        st.error("Gemini client is not available. Cannot standardize description.")
+        return {}
+
     tags_summary = (
         "\n--- TAGS REFERENCE ---\n"
         f"Subway Location tags: {', '.join(tags['locations'][:50])}\n"
@@ -343,6 +359,7 @@ def standardize_description(text_block: str, tags: Dict) -> Dict:
 
     full_prompt = f"{STANDARDIZER_PROMPT}\n\nHere is the structured input to standardize:\n{text_block}\n{tags_summary}"
 
+    # Use safe_generate so we see real errors
     response = safe_generate(full_prompt, context="standardize_description")
 
     try:
@@ -360,10 +377,12 @@ def standardize_description(text_block: str, tags: Dict) -> Dict:
         for key in ["subway_location", "color", "item_type"]:
             if key in data and isinstance(data[key], str):
                 data[key] = [data[key]]
-            elif key not in data:
+            elif key not in data or data[key] is None:
+                data[key] = []
+            elif key in data and data[key] == ["null"]:
                 data[key] = []
 
-        if "item_category" not in data:
+        if "item_category" not in data or data["item_category"] is None:
             data["item_category"] = "null"
 
         if "description" not in data:
@@ -400,6 +419,7 @@ def get_all_found_items_raw() -> Tuple[List[str], List[str], List[Dict[str, Any]
     try:
         coll = vector_store._collection
         data = coll.get()
+        # Data is returned as dict with keys 'ids', 'documents', 'metadatas'
         return data.get("ids", []), data.get("documents", []), data.get("metadatas", [])
     except Exception:
         return [], [], []
@@ -419,11 +439,11 @@ def get_all_found_items_as_df() -> pd.DataFrame:
         rows.append(
             {
                 "found_id": meta.get("found_id", id_),
-                "description": meta.get("description", doc),
-                "subway_location": ", ".join(meta.get("subway_location", [])),
-                "color": ", ".join(meta.get("color", [])),
+                "description": doc,  # Use the document content for full description
+                "subway_location": meta.get("subway_location", ""),
+                "color": meta.get("color", ""),
                 "item_category": meta.get("item_category", ""),
-                "item_type": ", ".join(meta.get("item_type", [])),
+                "item_type": meta.get("item_type", ""),
                 "contact": meta.get("contact", ""),
                 "time": meta.get("time", ""),
             }
@@ -437,12 +457,16 @@ def get_all_found_items_as_df() -> pd.DataFrame:
 def get_next_found_id() -> int:
     """Generate a simple incremental ID for found items (for display/admin)."""
     if "next_found_id" not in st.session_state:
-        # Derive from existing items so IDs don't reset
         df = get_all_found_items_as_df()
         if df.empty:
             st.session_state.next_found_id = 1
         else:
-            st.session_state.next_found_id = int(df["found_id"].max()) + 1
+            # Safely cast and increment the maximum ID
+            try:
+                max_id = df["found_id"].apply(lambda x: int(x) if isinstance(x, str) and x.isdigit() else 0).max()
+                st.session_state.next_found_id = max_id + 1
+            except:
+                st.session_state.next_found_id = 1
     nid = st.session_state.next_found_id
     st.session_state.next_found_id += 1
     return nid
@@ -451,7 +475,7 @@ def get_next_found_id() -> int:
 def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
     """
     Add a found item into Chroma vector DB with metadata.
-    Returns a local numeric ID.
+    FIXED: Converts list metadata to strings for vector store compatibility.
     """
     if vector_store is None:
         st.error("Vector store is not available; cannot save found item.")
@@ -464,27 +488,36 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
 
     found_id = get_next_found_id()
 
+    # 1. Prepare Metadata (Convert all list fields to comma-separated strings)
     metadata = {
         "record_type": "found",
-        "found_id": found_id,
-        "subway_location": json_data.get("subway_location", []),
-        "color": json_data.get("color", []),
-        "item_category": json_data.get("item_category", ""),
-        "item_type": json_data.get("item_type", []),
+        "found_id": str(found_id),
+        "image_path": MOCK_IMAGE_URL, # Using mock URL for now
+        
+        # --- FIX APPLIED HERE: CONVERTING LISTS TO STRINGS ---
+        "subway_location": ", ".join(json_data.get("subway_location", [])),
+        "color": ", ".join(json_data.get("color", [])),
+        "item_category": json_data.get("item_category", "null"),
+        "item_type": ", ".join(json_data.get("item_type", [])),
+        # ----------------------------------------------------
+        
         "description": description,
         "contact": contact,
         "time": json_data.get("time"),
     }
 
     try:
+        # 2. Store the document and its simple metadata in Chroma
         vector_store.add_texts(
             texts=[description],
             metadatas=[metadata],
             ids=[str(found_id)],
         )
-        vector_store.persist()
+        # Note: Chroma auto-persists in the defined directory
+        st.success(f"Found item saved with ID: {found_id} and embedded in Chroma.")
         return found_id
     except Exception as e:
+        # Catch and log the error specifically related to vector storage
         st.error(f"Error saving found item to vector store: {e}")
         return -1
 
@@ -493,45 +526,86 @@ def search_matches_for_lost_item(
     final_json: Dict, top_k: int, max_distance: float
 ) -> Tuple[List[Any], List[Any]]:
     """
-    Use vector DB (Chroma) to search for similar found items.
-    Returns (all_candidates, filtered_by_distance)
+    Performs Hybrid Search: Metadata Filter (Category) + Vector Search (Cosine).
     """
     if vector_store is None:
-        return [], []
+        st.warning("Vector store is not available for matching. Returning mock results.")
+        # Mock result for visual display if Chroma is down
+        return (
+            [
+                (Document(page_content="Mock Red Backpack", metadata={"found_id": "M99", "item_category": "Bags", "color": "Red"}), 0.95),
+                (Document(page_content="Mock Black Phone", metadata={"found_id": "M98", "item_category": "Electronics", "color": "Black"}), 0.88)
+            ],
+            [
+                (Document(page_content="Mock Red Backpack", metadata={"found_id": "M99", "item_category": "Bags", "color": "Red"}), 0.95),
+            ]
+        )
+
+    # 1. Extract Structured Filters
+    category_filter = final_json.get("item_category")
+    
+    langchain_filter: Dict[str, str] = {}
+    
+    # Only apply category filter if valid
+    if category_filter and category_filter != "null":
+        # Chroma/LangChain filtering syntax (exact match)
+        langchain_filter["item_category"] = category_filter
 
     query_text = final_json.get("description", "")
     if not query_text:
         return [], []
+    
+    st.info(f"Hybrid Search Query: '{query_text[:30]}...' | Filter: {langchain_filter}")
 
-    # Optional filter by category
-    filter_dict: Dict[str, Any] = {"record_type": "found"}
-    if final_json.get("item_category") and final_json["item_category"] != "null":
-        filter_dict["item_category"] = final_json["item_category"]
-
+    # 2. Execute Hybrid Search
+    # similarity_search_with_score returns a list of tuples: (Document, score)
     try:
         docs_scores = vector_store.similarity_search_with_score(
             query_text,
             k=top_k,
-            filter=filter_dict,
+            where=langchain_filter # Use 'where' for metadata filtering in Chroma
         )
     except Exception as e:
-        st.error(f"Error during vector search: {e}")
+        st.error(f"Error during vector search query: {e}")
         docs_scores = []
 
+    # 3. Filter by distance threshold (post-processing)
+    # Chroma returns distance (lower score = closer/more similar)
+    all_candidates = docs_scores
     filtered = [(doc, score) for doc, score in docs_scores if score <= max_distance]
-    return docs_scores, filtered
+    
+    return all_candidates, filtered
 
 
 # -----------------------
 # APP INIT
 # -----------------------
 
-tag_data = load_tag_data()
-if not tag_data:
-    st.stop()
+st.set_page_config(
+    page_title="Lost & Found Intake",
+    page_icon="🧳",
+    layout="wide",
+)
 
-if gemini_client is None:
-    st.stop()
+# Ensure the mock file exists
+if not os.path.exists("Tags.xlsx"):
+    load_tag_data()
+
+# Ensure database tables exist
+# (SQLite is only used for metadata persistence outside of the vector store here)
+with sqlite3.connect("lost_and_found.db") as conn:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lost_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            description TEXT,
+            contact TEXT,
+            email TEXT,
+            json_data TEXT
+        )
+    """
+    )
+
 
 # -----------------------
 # SIDEBAR NAV + MATCHING CONTROLS
@@ -621,12 +695,18 @@ if page.startswith("👮"):
         st.markdown('<div class="section-title">➕ Start a New Found Item</div>', unsafe_allow_html=True)
         with st.container():
             col1, col2 = st.columns(2)
+            uploaded_image = None
+            initial_text = ""
+            
             with col1:
                 uploaded_image = st.file_uploader(
                     "📷 Image of the found item (optional)",
                     type=["jpg", "jpeg", "png"],
                     key="operator_image",
                 )
+                if uploaded_image:
+                     st.image(Image.open(uploaded_image).convert("RGB"), width=220, caption="Preview of found item")
+
             with col2:
                 initial_text = st.text_input(
                     "📝 Short description",
@@ -634,31 +714,29 @@ if page.startswith("👮"):
                     key="operator_text",
                 )
 
-        if st.button("🚀 Start Intake"):
-            if not uploaded_image and not initial_text:
-                st.error("Please upload an image or enter a short description.")
-            else:
-                message_content = ""
-                if uploaded_image:
-                    img = Image.open(uploaded_image).convert("RGB")
-                    st.image(img, width=220, caption="Preview of found item")
-                    message_content += "I have uploaded an image of the found item. "
-                if initial_text:
-                    message_content += initial_text
+            if st.button("🚀 Start Intake"):
+                if not uploaded_image and not initial_text:
+                    st.error("Please upload an image or enter a short description.")
+                else:
+                    message_content = ""
+                    if uploaded_image:
+                        message_content += "I have uploaded an image of the found item. "
+                    if initial_text:
+                        message_content += initial_text
 
-                st.session_state.operator_msgs.append(
-                    {"role": "user", "content": message_content}
-                )
-                with st.spinner("Analyzing item with Gemini..."):
-                    response = safe_send(
-                        st.session_state.operator_chat,
-                        message_content,
-                        context="operator intake",
+                    st.session_state.operator_msgs.append(
+                        {"role": "user", "content": message_content}
                     )
-                st.session_state.operator_msgs.append(
-                    {"role": "model", "content": response.text}
-                )
-                st.rerun()
+                    with st.spinner("Analyzing item with Gemini..."):
+                        response = safe_send(
+                            st.session_state.operator_chat,
+                            message_content,
+                            context="operator intake",
+                        )
+                    st.session_state.operator_msgs.append(
+                        {"role": "model", "content": response.text}
+                    )
+                    st.rerun()
 
     # Continue chat
     operator_input = st.chat_input("Add more details for the operator bot, or say 'done' when ready.")
@@ -675,7 +753,9 @@ if page.startswith("👮"):
         st.session_state.operator_msgs.append(
             {"role": "model", "content": response.text}
         )
+        st.session_state.operator_input = "" # Clear input
         st.rerun()
+
 
     # When final structured record appears
     if st.session_state.operator_msgs and is_structured_record(
@@ -697,6 +777,8 @@ if page.startswith("👮"):
                 found_id = save_found_item_to_vectorstore(final_json, contact)
                 if found_id > 0:
                     st.success(f"Found item saved with ID `{found_id}` (Chroma vector DB).")
+                    st.session_state.operator_msgs = [] # Clear chat on success
+                    st.rerun()
 
 
 # ===============================================================
@@ -808,7 +890,7 @@ if page.startswith("🧍"):
     ):
         structured_text = st.session_state.user_msgs[-1]["content"]
 
-        st.markdown('<div class="section-title">🧩 Final Structured Record (Before Standardization)</div>', unsafe_allow_html=True)
+        # 1. Merge dropdown choices with LLM output
         merged_text = f"""
 Subway Location: {location_choice or extract_field(structured_text, 'Subway Location')}
 Color: {extract_field(structured_text, 'Color')}
@@ -816,83 +898,81 @@ Item Category: {category_choice or extract_field(structured_text, 'Item Category
 Item Type: {type_choice or extract_field(structured_text, 'Item Type')}
 Description: {extract_field(structured_text, 'Description')}
         """
-        st.code(merged_text)
 
+        st.markdown('<div class="section-title">1. Standardizing Record</div>', unsafe_allow_html=True)
         final_json = standardize_description(merged_text, tag_data)
         if final_json:
-            st.markdown('<div class="section-title">🏷️ Standardized Lost Item</div>', unsafe_allow_html=True)
+            st.success("Standardized record created.")
             st.json(final_json)
 
-            st.markdown('<div class="section-title">📇 Contact Information</div>', unsafe_allow_html=True)
-            contact = st.text_input("Phone number (10 digits, numbers only)")
+            # 2. MATCHING WORKSTREAM (Hybrid Search)
+            st.markdown('<div class="section-title">2. Searching for Found Items (Hybrid Match)</div>', unsafe_allow_html=True)
+            
+            if vector_store is None:
+                st.error("Cannot perform matching: Vector store not configured.")
+            else:
+                with st.spinner("Executing Hybrid Vector Search..."):
+                    all_candidates, filtered = search_matches_for_lost_item(
+                        final_json,
+                        top_k=top_k_sidebar,
+                        max_distance=max_distance_sidebar,
+                    )
+                
+                if not all_candidates:
+                    st.info("No items are stored in the vector DB yet, so no matches can be returned.")
+                else:
+                    st.markdown('<div class="section-title">📌 Candidate Matches</div>', unsafe_allow_html=True)
+
+                    if not filtered:
+                        st.info(
+                            "No matches under the current distance threshold. "
+                            "Showing raw top-K candidates instead."
+                        )
+                        to_show = all_candidates
+                    else:
+                        to_show = filtered
+
+                    for doc, score in to_show:
+                        meta = doc.metadata or {}
+                        # Cosine distance is used; score close to 0 is high similarity (1.0 is max distance)
+                        similarity_pct = max(0.0, (1.0 - score) * 100.0)
+
+                        st.markdown(
+                            f"**Distance:** `{score:.4f}` · "
+                            f"**Similarity (approx):** `{similarity_pct:.1f}%`"
+                        )
+
+                        col_details, col_image = st.columns([4, 1])
+                        with col_details:
+                            st.write("**Description:**", meta.get("description", doc.page_content))
+                            st.caption(f"Category: {meta.get('item_category', 'N/A')}, Color: {meta.get('color', 'N/A')}")
+                            st.caption(f"Found item ID: {meta.get('found_id', 'N/A')}")
+                        with col_image:
+                            st.image(meta.get("image_path", MOCK_IMAGE_URL), caption="Found Item", width=100)
+
+                        st.markdown("---")
+
+
+            # 3. CONTACT AND SUBMISSION
+            st.markdown('<div class="section-title">3. Contact information</div>', unsafe_allow_html=True)
+            contact = st.text_input("Phone number, ten digits")
             email = st.text_input("Email address")
 
-            st.info("Your contact is only used to follow up if a strong match is found.")
-
-            if st.button("🔍 Submit & Search for Matches"):
+            if st.button("Submit Lost Item Report"):
                 if not validate_phone(contact):
-                    st.error("Please enter a ten digit phone number (no spaces).")
+                    st.error("Please enter a ten digit phone number without spaces.")
                 elif not validate_email(email):
                     st.error("Please enter a valid email address.")
                 else:
-                    st.success("Lost item report received (not stored permanently in DB for this demo).")
-
-                    if vector_store is None:
-                        st.info(
-                            "Vector store is not configured, so no matches can be shown yet."
-                        )
-                    else:
-                        with st.spinner(
-                            "Searching for similar found items using embeddings..."
-                        ):
-                            all_candidates, filtered = search_matches_for_lost_item(
-                                final_json,
-                                top_k=top_k_sidebar,
-                                max_distance=max_distance_sidebar,
-                            )
-
-                        if not all_candidates:
-                            st.info(
-                                "No items are stored in the vector DB yet, so no matches can be returned."
-                            )
-                        else:
-                            st.markdown('<div class="section-title">📌 Candidate Matches</div>', unsafe_allow_html=True)
-
-                            if not filtered:
-                                st.info(
-                                    "No matches under the current distance threshold. "
-                                    "Showing raw top-K candidates instead."
-                                )
-                                to_show = all_candidates
-                            else:
-                                to_show = filtered
-
-                            for doc, score in to_show:
-                                meta = doc.metadata or {}
-                                similarity_pct = max(0.0, (1.0 - score) * 100.0)
-
-                                st.markdown(
-                                    f"**Distance:** `{score:.4f}`  ·  "
-                                    f"**Similarity (approx):** `{similarity_pct:.1f}%`"
-                                )
-
-                                st.write("**Description:**", meta.get("description", doc.page_content))
-
-                                if meta.get("subway_location"):
-                                    st.write(
-                                        "🚉 Location:", ", ".join(meta["subway_location"])
-                                    )
-                                if meta.get("color"):
-                                    st.write("🎨 Color:", ", ".join(meta["color"]))
-                                if meta.get("item_category"):
-                                    st.write("📂 Category:", meta["item_category"])
-                                if meta.get("item_type"):
-                                    st.write("🔖 Type:", ", ".join(meta["item_type"]))
-
-                                st.caption(f"Found item ID: {meta.get('found_id', 'N/A')} · Time: {meta.get('time', '')}")
-                                with st.expander("View raw metadata"):
-                                    st.json(meta)
-                                st.markdown("---")
+                    add_lost_item(
+                        final_json.get("description", ""),
+                        contact,
+                        email,
+                        json.dumps(final_json),
+                    )
+                    st.success("Lost item report submitted and potential matches identified.")
+                    st.session_state.user_msgs = []
+                    st.rerun()
 
 
 # ===============================================================
