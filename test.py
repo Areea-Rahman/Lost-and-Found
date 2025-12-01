@@ -476,7 +476,7 @@ def get_next_found_id() -> int:
 def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
     """
     Add a found item into Chroma vector DB with metadata.
-    FIXED: Converts list metadata to strings for vector store compatibility.
+    FIXED: Implements aggressive type conversion to ensure no lists/dicts are passed.
     """
     if vector_store is None:
         st.error("Vector store is not available; cannot save found item.")
@@ -489,33 +489,33 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
 
     found_id = get_next_found_id()
 
-    # 1. Prepare Metadata (Convert all list fields to comma-separated strings)
-    # This is the crucial step to avoid the "got list" error from the vector store
-    metadata = {
+    # 1. Start with the metadata structure and aggressively flatten all values
+    metadata_raw = {
         "record_type": "found",
         "found_id": str(found_id),
-        "image_path": MOCK_IMAGE_URL, # Using mock URL for now
-        
-        # --- FIX: CONVERTING LIST FIELDS TO COMMA-SEPARATED STRINGS ---
-        "subway_location": ", ".join(json_data.get("subway_location", [])),
-        "color": ", ".join(json_data.get("color", [])),
-        "item_category": json_data.get("item_category", "null"),
-        "item_type": ", ".join(json_data.get("item_type", [])),
-        # ----------------------------------------------------------------
-        
-        "description": description,
+        "image_path": MOCK_IMAGE_URL, 
         "contact": contact,
         "time": json_data.get("time"),
     }
     
-    # 2. Final check to ensure NO list remains (only string, int, float, bool)
-    # This loop forces all remaining keys to string representation if they aren't primitive types
-    for key, value in metadata.items():
-        if isinstance(value, (list, dict)):
-            metadata[key] = json.dumps(value) # Fallback to JSON string if it's a list/dict
+    # 2. Add all fields from final_json, aggressively converting lists to strings
+    metadata = {}
+    for key, value in json_data.items():
+        if isinstance(value, list):
+            # Convert list to comma-separated string for vector store metadata
+            metadata[key] = ", ".join(map(str, value))
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            # Simple primitive types are fine
+            metadata[key] = value
+        else:
+            # Fallback for unexpected types (like dicts) to JSON string
+            metadata[key] = json.dumps(value) 
+
+    # 3. Merge raw essential metadata (contact, ID) back in
+    metadata.update(metadata_raw)
 
     try:
-        # 3. Store the document and its simple metadata in Chroma
+        # 4. Store the document and its clean metadata in Chroma
         vector_store.add_texts(
             texts=[description],
             metadatas=[metadata],
@@ -527,6 +527,7 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
     except Exception as e:
         # Catch and log the error specifically related to vector storage
         st.error(f"Error saving found item to vector store: {e}")
+        st.error("Please check your LLM's raw JSON output for complex types being created.")
         return -1
 
 
