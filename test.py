@@ -20,7 +20,7 @@ from google.genai import errors as genai_errors
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document 
-from langchain_community.vectorstores.utils import filter_complex_metadata # FIX: ADDED MISSING IMPORT
+# REMOVED: from langchain_community.vectorstores.utils import filter_complex_metadata 
 
 
 # -----------------------
@@ -490,7 +490,7 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
 
     found_id = get_next_found_id()
 
-    # 1. Start with the metadata structure and aggressively flatten all values
+    # 1. Prepare Metadata (This dictionary will be passed to Chroma)
     metadata_base = {
         "record_type": "found",
         "found_id": str(found_id),
@@ -520,8 +520,9 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
     try:
         metadata = filter_complex_metadata(metadata)
     except Exception as e:
-        st.error(f"Failed to run LangChain filter_complex_metadata: {e}")
-        return -1
+        # LOGGING: The utility failed, but we must use the dictionary we just cleaned.
+        st.error(f"Failed to run LangChain filter_complex_metadata: {e}. Using manually cleaned dict.")
+        pass # Continue using the manually cleaned 'metadata' dict
 
 
     try:
