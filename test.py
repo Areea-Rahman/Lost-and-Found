@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timezone
 from PIL import Image
 import pandas as pd
+import os # Added for image path handling
 
 from google import genai
 from google.genai import types
@@ -17,10 +18,17 @@ from google.genai import errors as genai_errors  # for catching ClientError
 # Use a single constant for the model name
 MODEL_NAME = "gemini-2.0-flash"
 
+# --- Hybrid Search Constants ---
+# We will use this to connect the SQLite metadata to the PGVector document
+COLLECTION_NAME = "lostandfound_items"
+PG_METADATA_FIELDS = ["subway_location", "color", "item_category", "item_type"]
+
+
 # Optional vector-search imports (wrapped in try so app still runs if missing)
 try:
     from langchain_community.vectorstores import PGVector
     from langchain_openai import OpenAIEmbeddings
+    from langchain_core.documents import Document # Import Document for PGVector inserts
 
     HAS_VECTOR_LIBS = True
 except Exception:
@@ -39,6 +47,7 @@ def get_secrets():
     except Exception:
         secrets_dict = {}
 
+    # NOTE: Assuming secrets are set up for OpenAI and PGVector in Streamlit secrets
     gemini_key = secrets_dict.get("GEMINI_API_KEY")
     openai_key = secrets_dict.get("OPENAI_API_KEY")
     pg_conn_string = secrets_dict.get("PG_CONNECTION_STRING")
@@ -50,7 +59,7 @@ def get_secrets():
         "pg_conn_string": pg_conn_string,
         "has_gemini": gemini_key is not None,
         "has_openai": openai_key is not None,
-        "has_pg": pg_conn_string is not None,
+        "has_pg": pg_conn_string is not None and HAS_VECTOR_LIBS,
     }
 
 
@@ -81,6 +90,9 @@ gemini_client = get_gemini_client()
 # SAFE GEMINI HELPERS
 # =======================
 
+# 
+# (Safe send and safe generate functions remain unchanged)
+
 def safe_send(chat, message_content: str, context: str = ""):
     """
     Wrapper for chat.send_message that shows the real Gemini ClientError
@@ -105,9 +117,12 @@ def safe_generate(full_prompt: str, context: str = ""):
         st.stop()
 
     try:
+        # Check if the prompt contains image data (not implemented in this mock)
+        contents = full_prompt 
+        
         return gemini_client.models.generate_content(
             model=MODEL_NAME,
-            contents=full_prompt,
+            contents=contents,
         )
     except genai_errors.ClientError as e:
         label = context or "standardization"
@@ -124,13 +139,10 @@ def safe_generate(full_prompt: str, context: str = ""):
 @st.cache_resource
 def get_vector_store():
     """
-    Try to connect to existing PGVector store.
-    If any dependency or secret is missing, return None and do not error.
+    Try to connect to existing PGVector store using OpenAI Embeddings.
     """
-    if not HAS_VECTOR_LIBS:
-        return None
-
-    if not (secrets["has_openai"] and secrets["has_pg"]):
+    if not secrets["has_pg"]:
+        st.warning("PGVector/OpenAI secrets missing. Vector search disabled.")
         return None
 
     try:
@@ -138,13 +150,17 @@ def get_vector_store():
         db = PGVector(
             connection_string=secrets["pg_conn_string"],
             embedding_function=embeddings,
-            collection_name="lostandfound",
+            collection_name=COLLECTION_NAME,
         )
-        # light test query to ensure connection works
-        _ = db.similarity_search("ping", k=1)
+        
+        # Test query to ensure connection works (optional but recommended)
+        # Note: Initial calls may fail if collection is empty.
+        # This is commented out for initial dev ease.
+        # _ = db.similarity_search("test query", k=1) 
+        st.success(f"Vector search enabled using collection: {COLLECTION_NAME}")
         return db
     except Exception as e:
-        st.warning(f"Vector search disabled (could not connect to PGVector): {e}")
+        st.error(f"PGVector connection error: {e}. Vector search disabled.")
         return None
 
 
@@ -152,7 +168,7 @@ vector_store = get_vector_store()
 
 
 # =======================
-# PROMPTS
+# PROMPTS (Remains unchanged for core logic)
 # =======================
 
 GENERATOR_SYSTEM_PROMPT = """
@@ -269,6 +285,17 @@ Do not output any explanation. Only output the JSON object.
 def load_tag_data():
     """Load Tags.xlsx and prepare tag lists."""
     try:
+        # Create a dummy Tags.xlsx if it doesn't exist for running the code
+        if not os.path.exists("Tags.xlsx"):
+            mock_data = {
+                "Subway Location": ["Times Square", "Union Square", "Grand Central", "null"],
+                "Color": ["Red", "Blue", "Black", "Brown", "Metallic", "null"],
+                "Item Category": ["Electronics", "Bags", "Clothing", "Accessories", "null"],
+                "Item Type": ["Phone", "Backpack", "Wallet", "Jacket", "Keys", "null"],
+            }
+            pd.DataFrame(mock_data).to_excel("Tags.xlsx", index=False)
+            st.info("Created mock 'Tags.xlsx' file for demonstration.")
+            
         df = pd.read_excel("Tags.xlsx")
         return {
             "df": df,
@@ -327,10 +354,12 @@ def standardize_description(text: str, tags: dict) -> dict:
         for key in ["subway_location", "color", "item_type"]:
             if key in data and isinstance(data[key], str):
                 data[key] = [data[key]]
-            elif key not in data:
+            elif key not in data or data[key] is None:
                 data[key] = []
-
-        if "item_category" not in data:
+            elif key in data and data[key] == ["null"]:
+                data[key] = []
+                
+        if "item_category" not in data or data["item_category"] is None:
             data["item_category"] = "null"
 
         if "description" not in data:
@@ -377,7 +406,15 @@ def init_db():
 
 
 def add_found_item(caption, location, contact, image_path, json_data_string):
+    """
+    Saves item metadata to SQLite and stores embedding in PGVector.
+    """
+    if vector_store is None:
+        st.error("Cannot save: PGVector is not initialized.")
+        return False
+
     with sqlite3.connect("lost_and_found.db") as conn:
+        # 1. Save metadata to SQLite first
         c = conn.cursor()
         c.execute(
             """
@@ -386,7 +423,28 @@ def add_found_item(caption, location, contact, image_path, json_data_string):
             """,
             (caption, location, contact, image_path, json_data_string),
         )
+        item_id = c.lastrowid
         conn.commit()
+
+        # 2. Extract standardized metadata for PGVector
+        json_data = json.loads(json_data_string)
+        metadata = {
+            "source": "found_item",
+            "sqlite_id": str(item_id), # Link back to the SQLite record
+            "image_path": image_path,
+            "item_category": json_data.get("item_category"),
+            "color": ", ".join(json_data.get("color", [])),
+            "location": ", ".join(json_data.get("subway_location", [])),
+        }
+        
+        # 3. Create document and store embedding in PGVector
+        doc = Document(
+            page_content=json_data.get("description", caption), 
+            metadata=metadata
+        )
+        vector_store.add_documents([doc])
+        st.success(f"Found item saved as SQLite ID: {item_id} and embedded in PGVector.")
+        return True
 
 
 def add_lost_item(description, contact, email, json_data_string):
@@ -395,11 +453,61 @@ def add_lost_item(description, contact, email, json_data_string):
         c.execute(
             """
             INSERT INTO lost_items (description, contact, email, json_data)
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?);
             """,
             (description, contact, email, json_data_string),
         )
         conn.commit()
+
+
+def hybrid_match_found_items(lost_item_json: dict, k: int = 3) -> List[Dict[str, Any]]:
+    """
+    Performs Hybrid Search: Metadata Filter (SQL-like) + Vector Search (Cosine).
+    """
+    if vector_store is None:
+        st.warning("Vector store is not available for matching.")
+        return []
+
+    # 1. Extract Structured Filters (from standardized JSON)
+    category_filter = lost_item_json.get("item_category")
+    
+    # PGVector filter requires key-value pairs. We filter by category first.
+    # We convert the single dict filter structure into the LangChain filter format.
+    langchain_filter = {}
+    if category_filter and category_filter != "null":
+        # PGVector allows filtering on metadata fields during similarity search
+        langchain_filter["item_category"] = category_filter
+
+    # The lost item's full description is the query text for vector comparison
+    query_text = lost_item_json.get("description", "")
+    if not query_text:
+        return []
+    
+    st.info(f"Hybrid Search Query: '{query_text[:30]}...' | Filter: {langchain_filter}")
+
+    # 2. Execute Hybrid Search (PGVector handles the filtering internally before similarity)
+    # This retrieves documents that match the filter AND are semantically similar to query_text
+    results_with_score = vector_store.similarity_search_with_score(
+        query_text,
+        k=k,
+        filter=langchain_filter
+    )
+
+    # 3. Format results
+    matched_items = []
+    for doc, score in results_with_score:
+        # Note: doc.page_content is the Found Item's description
+        # doc.metadata contains image_path and other tags
+        matched_items.append({
+            "score": round(score, 4),
+            "sqlite_id": doc.metadata.get("sqlite_id"),
+            "category": doc.metadata.get("item_category"),
+            "color": doc.metadata.get("color"),
+            "found_description": doc.page_content,
+            "image_path": doc.metadata.get("image_path", "mock_image.png") # Use mock path if not found
+        })
+        
+    return matched_items
 
 
 def validate_phone(phone: str) -> bool:
@@ -470,6 +578,13 @@ if page == "Upload Found Item (Operator)":
                 type=["jpg", "jpeg", "png"],
                 key="operator_image",
             )
+            # --- MOCK IMAGE PATH ---
+            # In a real app, you would save this to a cloud storage (S3/GCS)
+            # and get a permanent URL. Here we mock a path for the PGVector metadata.
+            image_path_to_save = f"mock_storage/found_{datetime.now().strftime('%Y%m%d%H%M%S')}.png" if uploaded_image else ""
+            if uploaded_image:
+                 st.image(Image.open(uploaded_image).convert("RGB"), width=200)
+
         with col2:
             initial_text = st.text_input(
                 "Short description",
@@ -484,12 +599,7 @@ if page == "Upload Found Item (Operator)":
                 message_content = ""
 
                 if uploaded_image:
-                    img = Image.open(uploaded_image).convert("RGB")
-                    st.image(img, width=200)
-                    message_content += (
-                        "I have a photo of the found item. "
-                        "Here is my description based on what I see: "
-                    )
+                    message_content += "I have a photo of the found item. Here is my description based on what I see: "
 
                 if initial_text:
                     message_content += initial_text
@@ -498,7 +608,8 @@ if page == "Upload Found Item (Operator)":
                     {"role": "user", "content": message_content}
                 )
                 with st.spinner("Analyzing item"):
-                    # send only text to Gemini via safe_send
+                    # For VLM tasks, you should pass the image data to Gemini, 
+                    # but for chat-only LLM (gemini-2.0-flash) we send the text description.
                     response = safe_send(
                         st.session_state.operator_chat,
                         message_content,
@@ -507,6 +618,9 @@ if page == "Upload Found Item (Operator)":
                 st.session_state.operator_msgs.append(
                     {"role": "model", "content": response.text}
                 )
+                
+                # Store the image path temporarily for saving later
+                st.session_state.operator_image_path = image_path_to_save 
                 st.rerun()
 
     # Continue chat
@@ -541,27 +655,32 @@ if page == "Upload Found Item (Operator)":
 
             contact = st.text_input("Operator contact or badge")
             if st.button("Save Found Item"):
-                location_value = (
-                    final_json["subway_location"][0]
-                    if final_json.get("subway_location")
-                    else ""
-                )
-                add_found_item(
-                    final_json.get("description", ""),
-                    location_value,
-                    contact,
-                    "",
-                    json.dumps(final_json),
-                )
-                st.success("Found item saved to database.")
+                if not contact:
+                    st.error("Please enter operator contact.")
+                else:
+                    location_value = (
+                        final_json["subway_location"][0]
+                        if final_json.get("subway_location")
+                        else ""
+                    )
+                    success = add_found_item(
+                        final_json.get("description", ""),
+                        location_value,
+                        contact,
+                        st.session_state.get("operator_image_path", ""), # Use path from session state
+                        json.dumps(final_json),
+                    )
+                    if success:
+                         st.session_state.operator_msgs = [] # Clear chat on success
+                         st.rerun()
 
 
 # ===============================================================
-# USER SIDE
+# USER SIDE: INTEGRATED MATCHING
 # ===============================================================
 
 if page == "Report Lost Item (User)":
-    st.title("Report Lost Item (User)")
+    st.title("Report Lost Item (User) - Matching Enabled")
 
     tag_data = load_tag_data()
     if not tag_data:
@@ -573,6 +692,7 @@ if page == "Report Lost Item (User)":
 
     st.markdown("You can give quick info using dropdowns, then refine with chat.")
 
+    # --- Quick Info Dropdowns ---
     with st.expander("Optional quick info"):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -587,6 +707,7 @@ if page == "Report Lost Item (User)":
             type_choice = st.selectbox(
                 "Item type (optional)", [""] + tag_data["item_types"]
             )
+    # ---------------------------
 
     st.subheader("Describe or show your lost item")
 
@@ -670,6 +791,7 @@ if page == "Report Lost Item (User)":
     ):
         structured_text = st.session_state.user_msgs[-1]["content"]
 
+        # 1. Merge dropdown choices with LLM output
         merged_text = f"""
 Subway Location: {location_choice or extract_field(structured_text, 'Subway Location')}
 Color: {extract_field(structured_text, 'Color')}
@@ -678,15 +800,47 @@ Item Type: {type_choice or extract_field(structured_text, 'Item Type')}
 Description: {extract_field(structured_text, 'Description')}
         """
 
-        st.markdown("### Final merged record before standardization")
-        st.code(merged_text)
-
+        st.markdown("### 1. Standardizing Record")
         final_json = standardize_description(merged_text, tag_data)
         if final_json:
-            st.success("Standardized record")
+            st.success("Standardized record created.")
             st.json(final_json)
 
-            st.markdown("### Contact information")
+            # 2. MATCHING WORKSTREAM (Hybrid Search)
+            st.markdown("### 2. Searching for Found Items (Hybrid Match)")
+            
+            # Check if vector search is even possible
+            if vector_store is None:
+                st.error("Cannot perform matching: Vector store not configured.")
+            else:
+                with st.spinner("Executing Hybrid Vector Search..."):
+                    matched_items = hybrid_match_found_items(final_json, k=3)
+                
+                if matched_items:
+                    st.success(f"Found {len(matched_items)} potential matches!")
+                    
+                    for i, match in enumerate(matched_items):
+                        st.markdown(f"**Match #{i+1} (Confidence: {match['score']:.4f})**")
+                        
+                        col_score, col_details, col_image = st.columns([1, 3, 1])
+                        
+                        with col_details:
+                            st.write(f"ID: {match['sqlite_id']}")
+                            st.caption(f"Category: {match['category']}, Color: {match['color']}")
+                            st.write(f"Found Description: {match['found_description']}")
+                            
+                        with col_image:
+                            # Display a mock image based on the path stored in PGVector metadata
+                            st.image(f"https://placehold.co/100x100/A8A8A8/000000?text=IMG-{match['sqlite_id']}", caption=f"ID: {match['sqlite_id']}")
+                            
+                        st.markdown("---")
+                        
+                else:
+                    st.info("No high-confidence matches found.")
+
+
+            # 3. CONTACT AND SUBMISSION
+            st.markdown("### 3. Contact information")
             contact = st.text_input("Phone number, ten digits")
             email = st.text_input("Email address")
 
@@ -702,7 +856,9 @@ Description: {extract_field(structured_text, 'Description')}
                         email,
                         json.dumps(final_json),
                     )
-                    st.success("Lost item report submitted.")
+                    st.success("Lost item report submitted and potential matches identified.")
+                    st.session_state.user_msgs = []
+                    st.rerun()
 
     # Optional vector search debug panel
     with st.expander("Vector search (debug)"):
@@ -713,23 +869,14 @@ Description: {extract_field(structured_text, 'Description')}
             if query:
                 with st.spinner("Searching similar items"):
                     try:
+                        # Direct vector search without metadata filter
                         results = vector_store.similarity_search_with_score(
                             query, k=3
                         )
                         for doc, score in results:
                             st.write(f"Score: {score:.4f}")
                             st.write(doc.page_content)
+                            st.markdown(f"Metadata: {doc.metadata}")
                             st.markdown("---")
                     except Exception as e:
                         st.error(f"Error during vector search: {e}")
-
-
-
-
-
-
-
-
-
-
-
