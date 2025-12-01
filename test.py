@@ -20,7 +20,7 @@ from google.genai import errors as genai_errors
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document 
-# Removed: from langchain_community.vectorstores.utils import filter_complex_metadata 
+from langchain_community.vectorstores.utils import filter_complex_metadata # FIX: ADDED MISSING IMPORT
 
 
 # -----------------------
