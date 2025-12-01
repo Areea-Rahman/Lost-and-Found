@@ -20,7 +20,6 @@ from google.genai import errors as genai_errors
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document 
-# --- NEW REQUIRED IMPORT ---
 from langchain_community.vectorstores.utils import filter_complex_metadata 
 
 
@@ -491,34 +490,33 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
 
     found_id = get_next_found_id()
 
-    # 1. Start with the metadata structure and aggressively flatten all values
-    metadata_raw = {
-        "record_type": "found",
-        "found_id": str(found_id),
-        "image_path": MOCK_IMAGE_URL, 
-        "contact": contact,
-        "time": json.dumps(json_data.get("time")), # Ensure time is a string/json string
-    }
-    
-    # 2. Add all fields from final_json, aggressively converting lists to strings
+    # 1. Prepare Metadata (This dictionary will be passed to Chroma)
     metadata = {}
+    
+    # 2. Iterate through ALL keys/values in the final_json
     for key, value in json_data.items():
         if isinstance(value, list):
-            # Convert list to comma-separated string for vector store metadata
+            # FIXED: Convert list to comma-separated string for vector store metadata
             metadata[key] = ", ".join(map(str, value))
         elif isinstance(value, (str, int, float, bool)) or value is None:
             # Simple primitive types are fine
             metadata[key] = value
         else:
-            # Fallback for unexpected types (like dicts) to JSON string
-            # This ensures keys like 'subway_location' don't accidentally contain lists
+            # Fallback: Convert any unexpected complex type (like dicts) to JSON string
             metadata[key] = json.dumps(value) 
 
-    # 3. Merge raw essential metadata (contact, ID) back in
-    metadata.update(metadata_raw)
+    # 3. Add essential, un-standardized metadata
+    metadata["record_type"] = "found"
+    metadata["found_id"] = str(found_id)
+    metadata["image_path"] = MOCK_IMAGE_URL
+    metadata["contact"] = contact
+    
+    # 4. Filter complex metadata using LangChain's built-in utility (EXTRA LAYER OF DEFENSE)
+    # This utility is designed to catch residual complex types and convert them to strings/omit them
+    metadata = filter_complex_metadata(metadata)
 
     try:
-        # 4. Store the document and its clean metadata in Chroma
+        # 5. Store the document and its clean metadata in Chroma
         vector_store.add_texts(
             texts=[description],
             metadatas=[metadata],
@@ -531,7 +529,7 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
         # Catch and log the error specifically related to vector storage
         st.error(f"Error saving found item to vector store: {e}")
         st.error(f"Failed metadata dump: {metadata}")
-        st.error("Please check your LLM's raw JSON output for complex types being created.")
+        st.error("A list or complex type survived the cleaning.")
         return -1
 
 
