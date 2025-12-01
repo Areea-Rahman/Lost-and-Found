@@ -2,15 +2,15 @@
 # LOST & FOUND INTAKE SYSTEM (Chroma Vector DB)
 # =======================
 
+import streamlit as st
+import sqlite3
 import json
 import re
-import sqlite3
 import os 
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
 
 import pandas as pd
-import streamlit as st
 from PIL import Image
 
 from google import genai
@@ -251,7 +251,9 @@ Do not include your questions or reasoning in the final structured record.
 """
 
 STANDARDIZER_PROMPT = """
-You are the Lost and Found Data Standardizer for a public transit system.<br>You receive structured text from another model describing an item.<br>Your task is to map free text fields to standardized tag values and produce a clean JSON record.
+You are the Lost and Found Data Standardizer for a public transit system.
+You receive structured text from another model describing an item.
+Your task is to map free text fields to standardized tag values and produce a clean JSON record.
 
 Tag Source:
 All valid standardized values are in the provided Tags Excel reference summary.
@@ -488,14 +490,13 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
     found_id = get_next_found_id()
 
     # 1. Prepare Metadata (Convert all list fields to comma-separated strings)
-    # The Chroma vector store requires primitive types (str, int, float, bool)
+    # This is the crucial step to avoid the "got list" error from the vector store
     metadata = {
         "record_type": "found",
         "found_id": str(found_id),
         "image_path": MOCK_IMAGE_URL, # Using mock URL for now
         
         # --- FIX: CONVERTING LIST FIELDS TO COMMA-SEPARATED STRINGS ---
-        # This resolves the error: "Expected metadata value to be a str... got list"
         "subway_location": ", ".join(json_data.get("subway_location", [])),
         "color": ", ".join(json_data.get("color", [])),
         "item_category": json_data.get("item_category", "null"),
@@ -506,9 +507,15 @@ def save_found_item_to_vectorstore(json_data: Dict, contact: str) -> int:
         "contact": contact,
         "time": json_data.get("time"),
     }
+    
+    # 2. Final check to ensure NO list remains (only string, int, float, bool)
+    # This loop forces all remaining keys to string representation if they aren't primitive types
+    for key, value in metadata.items():
+        if isinstance(value, (list, dict)):
+            metadata[key] = json.dumps(value) # Fallback to JSON string if it's a list/dict
 
     try:
-        # 2. Store the document and its simple metadata in Chroma
+        # 3. Store the document and its simple metadata in Chroma
         vector_store.add_texts(
             texts=[description],
             metadatas=[metadata],
@@ -581,12 +588,6 @@ def search_matches_for_lost_item(
 # -----------------------
 # APP INIT
 # -----------------------
-
-st.set_page_config(
-    page_title="Lost & Found Intake",
-    page_icon="🧳",
-    layout="wide",
-)
 
 # Ensure the mock file exists
 if not os.path.exists("Tags.xlsx"):
