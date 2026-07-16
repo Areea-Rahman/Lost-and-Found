@@ -4,6 +4,7 @@
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
 
@@ -164,34 +165,58 @@ vector_store = get_vector_store()
 # SAFE GEMINI HELPERS
 # -----------------------
 
-def safe_send(chat, message_content: str, context: str = ""):
-    """Wrapper around chat.send_message with clear error reporting."""
-    try:
-        return chat.send_message(message_content)
-    except genai_errors.ClientError as e:
-        label = context or "chat"
-        st.error(f"Gemini ClientError during {label}: {e}")
-        if getattr(e, "response_json", None):
-            st.json(e.response_json)
-        st.stop()
+def safe_send(chat, message_content: str, context: str = "", max_retries: int = 3):
+    """Wrapper around chat.send_message with retries for transient outages
+    and clear error reporting for real failures."""
+    for attempt in range(max_retries):
+        try:
+            return chat.send_message(message_content)
+        except genai_errors.ServerError as e:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
+                continue
+            st.warning(
+                "The AI model is experiencing high demand right now. "
+                "Please wait a moment and try again — this is a temporary "
+                "issue on Google's end, not a bug in the app."
+            )
+            st.stop()
+        except genai_errors.ClientError as e:
+            label = context or "chat"
+            st.error(f"Gemini ClientError during {label}: {e}")
+            if getattr(e, "response_json", None):
+                st.json(e.response_json)
+            st.stop()
 
 
-def safe_generate(full_prompt: str, context: str = ""):
-    """Wrapper around generate_content with clear error reporting."""
+def safe_generate(full_prompt: str, context: str = "", max_retries: int = 3):
+    """Wrapper around generate_content with retries for transient outages
+    and clear error reporting for real failures."""
     if gemini_client is None:
         st.error("Gemini client is not available.")
         st.stop()
-    try:
-        return gemini_client.models.generate_content(
-            model=MODEL_NAME,
-            contents=full_prompt,
-        )
-    except genai_errors.ClientError as e:
-        label = context or "generation"
-        st.error(f"Gemini ClientError during {label}: {e}")
-        if getattr(e, "response_json", None):
-            st.json(e.response_json)
-        st.stop()
+    for attempt in range(max_retries):
+        try:
+            return gemini_client.models.generate_content(
+                model=MODEL_NAME,
+                contents=full_prompt,
+            )
+        except genai_errors.ServerError as e:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            st.warning(
+                "The AI model is experiencing high demand right now. "
+                "Please wait a moment and try again — this is a temporary "
+                "issue on Google's end, not a bug in the app."
+            )
+            st.stop()
+        except genai_errors.ClientError as e:
+            label = context or "generation"
+            st.error(f"Gemini ClientError during {label}: {e}")
+            if getattr(e, "response_json", None):
+                st.json(e.response_json)
+            st.stop()
 
 
 # -----------------------
