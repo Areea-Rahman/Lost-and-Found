@@ -28,7 +28,7 @@ os.makedirs(IMAGES_DIR, exist_ok=True)
 # BASIC CONFIG / THEME
 # -----------------------
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-flash-latest"
 
 st.set_page_config(
     page_title="Lost & Found Intake",
